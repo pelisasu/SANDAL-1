@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot - Ultimate Regime-Filtered Quant Engine (24/5 Ready)
+Production-Ready XAUUSD Deriv Bot - Semi-AI Adaptive Engine + Session Filter (24/5 Ready)
 """
 
 import os
@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("QuantBotElite")
+logger = logging.getLogger("QuantBotSemiAI")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -72,15 +72,13 @@ class TelegramNotifier:
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==========================================
-# MODUL KUANTITATIF & REGIME FILTER LANJUTAN
+# MODUL KUANTITATIF & SEMI-AI ENGINE
 # ==========================================
-class QuantitativeEngine:
+class SemiAIEngine:
     @staticmethod
     def calculate_atr(candles: list, period: int = 14) -> float:
-        """Menghitung Average True Range (ATR) aktual."""
         if len(candles) < period + 1:
             return 0.0
-        
         true_ranges = []
         for i in range(1, len(candles)):
             high = float(candles[i]['high'])
@@ -88,12 +86,10 @@ class QuantitativeEngine:
             close_prev = float(candles[i-1]['close'])
             tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
             true_ranges.append(tr)
-            
         return sum(true_ranges[-period:]) / period
 
     @staticmethod
     def calculate_sma(candles: list, period: int = 50) -> float:
-        """Menghitung Simple Moving Average untuk konfirmasi makro trend."""
         if len(candles) < period:
             return float(candles[-1]['close']) if candles else 0.0
         closes = [float(c['close']) for c in candles[-period:]]
@@ -101,7 +97,6 @@ class QuantitativeEngine:
 
     @staticmethod
     def kalman_filter_update(price: float, state_estimate: float, error_covariance: float) -> tuple:
-        """Penyaringan noise harga menggunakan Kalman Filter."""
         q = 1e-5  
         r = 1e-2  
         state_predict = state_estimate
@@ -113,27 +108,54 @@ class QuantitativeEngine:
         
         return state_estimate, error_covariance
 
+    @staticmethod
+    def evaluate_semi_ai_confidence(candles: list, deviation: float, atr: float) -> float:
+        """
+        Model Semi-AI (Rule-Based Probabilistic Scorer):
+        Menghitung skor probabilitas (0% s.d. 100%) berdasarkan konvergensi momentum, 
+        konsistensi body candle, dan rasio volatilitas tanpa butuh API eksternal.
+        """
+        if len(candles) < 10:
+            return 0.0
+        
+        recent = candles[-5:]
+        body_momentum = sum([abs(float(c['close']) - float(c['open'])) for c in recent]) / 5
+        
+        # Hitung skor probabilitas tiruan berbasis bobot matematis
+        volatility_score = min(1.0, atr / 5.0)
+        deviation_score = min(1.0, abs(deviation) / (atr * 1.5))
+        momentum_score = min(1.0, body_momentum / atr) if atr > 0 else 0.5
+        
+        # Gabungkan bobot fitur (Simulasi Random Forest Scoring)
+        confidence = (deviation_score * 0.4) + (momentum_score * 0.4) + (volatility_score * 0.2)
+        return round(confidence * 100, 2)
+
 # ==========================================
-# JADWAL OPERASIONAL WAKTU (SENIN 05:00 - SABTU 05:00 WIB)
+# JADWAL & FILTER SESI LIKUIDITAS PASAR (WIB)
 # ==========================================
-def is_market_active() -> bool:
+def is_market_active_and_liquid() -> bool:
+    """
+    Memeriksa jendela operasional 24/5 sekaligus membatasi pada sesi likuiditas tinggi 
+    (Sesi Eropa & Amerika: 13:00 - 23:00 WIB) untuk menghindari noise pasar tipis.
+    """
     now_utc = datetime.now(timezone.utc)
     now_wib = now_utc.astimezone(timezone(timedelta(hours=7)))
     weekday = now_wib.weekday()
     hour = now_wib.hour
-    minute = now_wib.minute
     
-    if weekday == 5: # Sabtu
-        if hour >= 5 and minute >= 1:
-            return False
-        elif hour > 5:
-            return False
-    if weekday == 6: # Minggu
+    # Hari Libur (Sabtu & Minggu)
+    if weekday == 5 and hour >= 5: # Sabtu di atas jam 05:00 libur
         return False
-    if weekday == 0: # Senin
-        if hour < 5:
-            return False
-    return True
+    if weekday == 6: # Minggu libur penuh
+        return False
+    if weekday == 0 and hour < 5: # Senin dini hari libur
+        return False
+        
+    # Sesi Likuiditas Optimal XAUUSD (Pukul 13:00 s.d 23:00 WIB)
+    if 13 <= hour < 23:
+        return True
+        
+    return False
 
 # ==========================================
 # DERIV WEBSOCKET CLIENT & MAIN EXECUTION
@@ -178,8 +200,8 @@ class DerivTradingBot:
                 if not self.is_initialized:
                     self.is_initialized = True
                     notifier.send_message(
-                        "🟢 *STARTUP NOTIFICATION (ELITE QUANT v2)*\n"
-                        "Sistem Bot Trading XAUUSD M5 dengan Regime Filter aktif & siap memantau pasar 24/5.",
+                        "🟢 *STARTUP NOTIFICATION (SEMI-AI QUANT v3)*\n"
+                        "Sistem Bot XAUUSD M5 Aktif. Dilengkapi Kalman Engine & Sesi Likuiditas Tinggi (13:00 - 23:00 WIB).",
                         force=True
                     )
         except Exception as e:
@@ -222,70 +244,75 @@ class DerivTradingBot:
         ws.send(json.dumps(sub_stream))
 
     def run_quantitative_analysis(self, current_close: float, high: float, low: float):
-        if not is_market_active():
-            logger.info("Pasar di luar jam operasional aktif. Bot dalam status standby.")
+        if not is_market_active_and_liquid():
+            logger.info("Diluar jam likuiditas optimal (13:00 - 23:00 WIB) atau pasar libur. Bot standby.")
             return
 
         if len(self.candles_cache) < 50:
             return
 
-        # 1. Kalman Filter State Update
+        # 1. Kalman Filter Update
         if self.kalman_state == 0.0:
             self.kalman_state = current_close
-        self.kalman_state, self.kalman_cov = QuantitativeEngine.kalman_filter_update(
+        self.kalman_state, self.kalman_cov = SemiAIEngine.kalman_filter_update(
             current_close, self.kalman_state, self.kalman_cov
         )
 
-        # 2. Volatility & Trend Regime Checks
-        atr = QuantitativeEngine.calculate_atr(self.candles_cache, period=14)
-        sma_50 = QuantitativeEngine.calculate_sma(self.candles_cache, period=50)
+        # 2. Indikator & Semi-AI Confidence Scoring
+        atr = SemiAIEngine.calculate_atr(self.candles_cache, period=14)
+        sma_50 = SemiAIEngine.calculate_sma(self.candles_cache, period=50)
         
         if atr == 0:
             return
 
+        deviation = current_close - self.kalman_state
+        ai_confidence = SemiAIEngine.evaluate_semi_ai_confidence(self.candles_cache, deviation, atr)
+
         calculated_tp_points = max(15.0, atr * 1.5)
         ultra_tight_sl_points = max(5.0, atr * 0.5)
 
-        deviation = current_close - self.kalman_state
+        # Hanya eksekusi jika skor kepercayaan Semi-AI di atas 65%
+        min_ai_threshold = 65.0
 
-        # Sinyal BUY Valid: Harga di bawah Kalman Mean DAN tren makro mendukung
-        if deviation < -(atr * 0.9) and current_close >= sma_50:
+        # Sinyal BUY Valid
+        if deviation < -(atr * 0.85) and current_close >= sma_50 and ai_confidence >= min_ai_threshold:
             entry_price = current_close
             tp_price = entry_price + calculated_tp_points
             sl_price = entry_price - ultra_tight_sl_points
             
             signal_msg = (
-                f"🚀 *VALID SIGNAL ALERT (BUY)*\n"
+                f"🚀 *VALID SIGNAL ALERT (BUY)* [SEMI-AI]\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
+                f"• *AI Confidence Score:* `{ai_confidence}%`\n"
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
                 f"• *Take Profit (TP):* `{tp_price:.2f}` (+{calculated_tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (-{ultra_tight_sl_points:.1f} Poin)\n"
-                f"• *Gatekeeper:* Kalman Reversion + SMA 50 Trend Alignment"
+                f"• *Engine:* Kalman Reversion + Session Liquidity Filter"
             )
             notifier.send_message(signal_msg)
 
-        # Sinyal SELL Valid: Harga di atas Kalman Mean DAN tren makro mendukung
-        elif deviation > (atr * 0.9) and current_close <= sma_50:
+        # Sinyal SELL Valid
+        elif deviation > (atr * 0.85) and current_close <= sma_50 and ai_confidence >= min_ai_threshold:
             entry_price = current_close
             tp_price = entry_price - calculated_tp_points
             sl_price = entry_price + ultra_tight_sl_points
             
             signal_msg = (
-                f"🚀 *VALID SIGNAL ALERT (SELL)*\n"
+                f"🚀 *VALID SIGNAL ALERT (SELL)* [SEMI-AI]\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
+                f"• *AI Confidence Score:* `{ai_confidence}%`\n"
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
                 f"• *Take Profit (TP):* `{tp_price:.2f}` (-{calculated_tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (+{ultra_tight_sl_points:.1f} Poin)\n"
-                f"• *Gatekeeper:* Kalman Reversion + SMA 50 Trend Alignment"
+                f"• *Engine:* Kalman Reversion + Session Liquidity Filter"
             )
             notifier.send_message(signal_msg)
 
     def start(self):
         while True:
             try:
-                if not is_market_active():
-                    logger.info("Pasar libur (Sabtu-Senin dini hari). Bot masuk mode tidur selama 1 jam...")
-                    time.sleep(3600)
+                if not is_market_active_and_liquid():
+                    time.sleep(1800) # Cek ulang setiap 30 menit jika diluar jam aktif
                     continue
 
                 logger.info("Menghubungkan ke server WebSocket Deriv...")
@@ -296,8 +323,6 @@ class DerivTradingBot:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                
-                # Jaga koneksi stabil dengan ping interval 15 detik
                 ws.run_forever(ping_interval=15, ping_timeout=10)
                 
             except Exception as e:
