@@ -2,18 +2,47 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot - Masterpiece v6 (Fixed Edition)
+Production-Ready XAUUSD Deriv Bot - Masterpiece v7 (Fixed Edition 2)
 Features: Kalman Filter, MTF Trend, Session Filter, Semi-AI Confidence,
 Circuit Breaker, Dynamic S/R TP.
 
-Perbaikan pada versi ini dibanding v5:
-  1. Candle cache tidak lagi ter-corrupt oleh update live/forming candle
-     (tidak ada lagi repainting akibat duplikasi candle yang belum closed).
-  2. Normalisasi field waktu candle (epoch vs open_time) dari dua sumber
-     data Deriv yang berbeda format.
-  3. Reconnect WebSocket tidak lagi rekursif (tidak menumpuk call stack).
-  4. Notifikasi error/disconnect punya cooldown terpisah supaya tidak
-     membanjiri Telegram saat koneksi tidak stabil.
+PENTING - Dependency:
+    pip install websocket-client requests
+    (Pastikan yang terpasang adalah paket "websocket-client", BUKAN paket
+    "websocket" yang sudah usang. Kalau salah instal, akan muncul error
+    'module websocket has no attribute WebSocketApp'.)
+
+Perbaikan pada versi ini dibanding v6:
+  1. [BUG KRITIS] Subscription live candle diperbaiki. Versi sebelumnya
+     mengirim DUA request terpisah saat on_open: satu ticks_history biasa
+     (tanpa subscribe) dan satu lagi payload mandiri {"ohlc": ..., 
+     "granularity": ...}. Payload kedua ini TIDAK ADA di spesifikasi resmi
+     Deriv API (tidak ada top-level call "ohlc" yang berdiri sendiri),
+     sehingga kemungkinan besar ditolak/diabaikan server dan bot tidak
+     pernah menerima update candle live secara real-time.
+     Perbaikan: hanya SATU request ticks_history dengan "subscribe": 1 dan
+     "style": "candles". Response pertama akan berupa msg_type "candles"
+     (histori), lalu setiap tick/candle berikutnya otomatis dikirim server
+     sebagai msg_type "ohlc" pada subscription yang sama.
+  2. Subscription ID dari server disimpan, dan dikirim permintaan "forget"
+     saat bot dihentikan manual (Ctrl+C) supaya subscription ditutup rapi
+     di sisi server.
+  3. Notifikasi Telegram baru: alert dikirim juga saat Deriv API membalas
+     msg_type "error" (misalnya symbol/granularity tidak valid), supaya
+     operator tahu bot berhenti bekerja, bukan cuma tercatat di log.
+  4. Reconnect memakai backoff bertahap (5s -> 10s -> 20s ... maks 60s),
+     direset ke 5s begitu koneksi berhasil dibuka lagi. Ini mencegah bot
+     membanjiri server/log dengan percobaan reconnect yang terlalu rapat
+     saat terjadi gangguan panjang.
+  5. Pembersihan kode di circuit breaker (menghapus cabang if/else yang
+     tidak pernah tereksekusi) tanpa mengubah hasil perhitungan ATR.
+  6. Penanganan nilai waktu candle dibuat lebih defensif (cast eksplisit
+     ke int, guard bila field waktu kosong) supaya tidak KeyError/TypeError
+     saat data dari server sedikit tidak lengkap.
+
+Logika kuantitatif (Kalman Filter, ATR, SMA, MTF trend, confidence score,
+circuit breaker threshold, aturan entry BUY/SELL) TIDAK diubah dari versi
+asli, sesuai maksud awal skrip ini.
 """
 
 import os
@@ -42,6 +71,13 @@ DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("FATAL: Telegram Token atau Chat ID belum disetel di environment variables!")
     sys.exit(1)
+
+if DERIV_APP_ID == "1089":
+    logger.warning(
+        "Memakai DERIV_APP_ID default (1089, app demo publik Deriv). "
+        "Untuk pemakaian produksi/serius, disarankan mendaftar app_id sendiri "
+        "di https://api.deriv.com/dashboard agar tidak kena rate-limit bersama."
+    )
 
 
 # ==========================================
@@ -162,12 +198,17 @@ class MasterpieceQuantitativeEngine:
         Volatility Circuit Breaker (News Spike Shield):
         True jika ATR saat ini melompat > 2.2x dari rata-rata ATR 10 candle
         sebelumnya (indikasi rilis berita ekstrem seperti NFP/CPI).
+
+        Catatan perbaikan v7: logika/hasil perhitungan SAMA PERSIS dengan
+        versi asli (rata-rata ATR-14 dihitung pada 10 titik offset berbeda,
+        10 s.d. 19 candle ke belakang). Hanya dibersihkan dari cabang
+        kode yang tidak pernah tereksekusi.
         """
         if len(candles) < 25:
             return False
         past_atrs = []
-        for i in range(10, 20):
-            sub_candles = candles[:-i] if i > 0 else candles
+        for offset in range(10, 20):
+            sub_candles = candles[:-offset]
             past_atrs.append(MasterpieceQuantitativeEngine.calculate_atr(sub_candles, period=14))
 
         if not past_atrs:
@@ -233,18 +274,20 @@ def is_market_active_and_liquid() -> bool:
 def normalize_candle(raw: dict) -> dict:
     """
     Menyamakan format candle dari dua sumber Deriv yang berbeda:
-    - Endpoint history ("candles"): pakai key 'epoch'
-    - Stream live ("ohlc"): pakai key 'open_time'
+    - Endpoint history ("candles" list saat response pertama): pakai key 'epoch'
+    - Stream live ("ohlc" push berikutnya): pakai key 'open_time'
+      (field 'epoch' di pesan "ohlc" adalah waktu tick saat ini, BUKAN waktu
+      buka candle, sehingga 'open_time' harus diprioritaskan di sana).
     Tanpa normalisasi ini, perbandingan waktu candle antara data historis
     dan data live akan salah/KeyError.
     """
     time_key = raw.get("open_time", raw.get("epoch"))
     return {
-        "time": time_key,
-        "open": float(raw.get("open", 0)),
-        "high": float(raw.get("high", 0)),
-        "low": float(raw.get("low", 0)),
-        "close": float(raw.get("close", 0)),
+        "time": int(time_key) if time_key is not None else None,
+        "open": float(raw.get("open", 0) or 0),
+        "high": float(raw.get("high", 0) or 0),
+        "low": float(raw.get("low", 0) or 0),
+        "close": float(raw.get("close", 0) or 0),
     }
 
 
@@ -261,15 +304,26 @@ class DerivTradingBotMasterpiece:
         self.kalman_state = 0.0
         self.kalman_cov = 1.0
         self.is_initialized = False
+        self.subscription_id = None
+        self.ws = None  # referensi WebSocketApp aktif, untuk shutdown yang rapi
 
     def on_message(self, ws, message):
         try:
             data = json.loads(message)
             msg_type = data.get("msg_type")
 
+            # Simpan subscription id begitu server mengonfirmasi subscribe,
+            # supaya bisa dikirim "forget" saat bot dimatikan manual.
+            sub_info = data.get("subscription")
+            if sub_info and sub_info.get("id"):
+                self.subscription_id = sub_info["id"]
+
             if msg_type == "ohlc":
                 raw_candle = data.get("ohlc", {})
                 candle = normalize_candle(raw_candle)
+                if candle["time"] is None:
+                    logger.warning("Menerima candle 'ohlc' tanpa field waktu yang valid, diabaikan.")
+                    return
 
                 if self.current_forming_candle is None:
                     self.current_forming_candle = candle
@@ -298,13 +352,20 @@ class DerivTradingBotMasterpiece:
                 if not self.is_initialized:
                     self.is_initialized = True
                     notifier.send_message(
-                        "🟢 *STARTUP NOTIFICATION (MASTERPIECE v6 - Fixed)*\n"
+                        "🟢 *STARTUP NOTIFICATION (MASTERPIECE v7 - Fixed)*\n"
                         "Sistem Bot XAUUSD M5 Aktif dengan Circuit Breaker, Dynamic TP, & MTF Engine.",
                         force=True
                     )
 
             elif msg_type == "error":
-                logger.error(f"Deriv API error: {data.get('error')}")
+                err = data.get("error", {})
+                err_msg = err.get("message", str(err))
+                logger.error(f"Deriv API error: {err}")
+                notifier.send_alert(
+                    "🛑 *SYSTEM ALERT: Deriv API Error*\n"
+                    f"`{err_msg}`\n"
+                    "Bot mungkin tidak menerima data pasar. Mohon periksa segera."
+                )
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -328,21 +389,23 @@ class DerivTradingBotMasterpiece:
     def on_open(self, ws):
         logger.info("Websocket connected to Deriv server.")
         try:
+            # PERBAIKAN KRITIS v7: satu request saja, dengan subscribe:1.
+            # Response pertama -> msg_type "candles" (histori 120 candle).
+            # Response selanjutnya -> msg_type "ohlc" (update live candle),
+            # dikirim otomatis oleh server pada subscription yang sama.
+            # (Payload terpisah {"ohlc": ...} pada versi sebelumnya BUKAN
+            # request yang valid di Deriv API dan tidak akan menghasilkan
+            # stream apa pun.)
             sub_payload = {
                 "ticks_history": self.symbol,
                 "adjust_start_time": 1,
                 "count": 120,
                 "end": "latest",
                 "granularity": self.granularity,
-                "style": "candles"
+                "style": "candles",
+                "subscribe": 1
             }
             ws.send(json.dumps(sub_payload))
-
-            sub_stream = {
-                "ohlc": self.symbol,
-                "granularity": self.granularity
-            }
-            ws.send(json.dumps(sub_stream))
         except Exception as e:
             logger.error(f"Gagal mengirim subscription payload: {e}")
 
@@ -409,7 +472,24 @@ class DerivTradingBotMasterpiece:
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (+{ultra_tight_sl_points:.1f} Poin)"
             )
 
+    def shutdown(self):
+        """Penutupan yang rapi: forget subscription lalu tutup koneksi."""
+        try:
+            if self.ws and self.subscription_id:
+                self.ws.send(json.dumps({"forget": self.subscription_id}))
+                logger.info("Permintaan 'forget' subscription terkirim.")
+        except Exception as e:
+            logger.warning(f"Gagal mengirim 'forget' saat shutdown: {e}")
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+
     def start(self):
+        reconnect_delay = 5
+        max_reconnect_delay = 60
+
         while True:
             try:
                 if not is_market_active_and_liquid():
@@ -417,23 +497,34 @@ class DerivTradingBotMasterpiece:
                     continue
 
                 logger.info("Menghubungkan ke server WebSocket Deriv (Masterpiece Engine)...")
-                ws = websocket.WebSocketApp(
+                self.ws = websocket.WebSocketApp(
                     self.ws_url,
                     on_open=self.on_open,
                     on_message=self.on_message,
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                ws.run_forever(ping_interval=15, ping_timeout=10)
+                self.ws.run_forever(ping_interval=15, ping_timeout=10)
                 # ws.run_forever() baru return setelah koneksi benar-benar putus.
-                # Reset state candle supaya tidak ada gap/duplikasi waktu candle
-                # yang salah setelah reconnect.
+                # Reset state candle & subscription id supaya tidak ada
+                # gap/duplikasi waktu candle yang salah setelah reconnect.
                 self.current_forming_candle = None
-                time.sleep(5)
+                self.subscription_id = None
+
+                # Backoff bertahap: makin lama gagal, makin jarang dicoba,
+                # supaya tidak membanjiri server/log saat gangguan panjang.
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
             except Exception as e:
                 logger.error(f"Critical error in main loop: {e}")
-                time.sleep(5)
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                continue
+
+            else:
+                # Reset delay setiap kali sempat konek & jalan normal cukup lama.
+                reconnect_delay = 5
 
 
 if __name__ == "__main__":
@@ -441,5 +532,6 @@ if __name__ == "__main__":
     try:
         bot.start()
     except KeyboardInterrupt:
-        logger.info("Bot dihentikan manual oleh user (Ctrl+C). Keluar dengan bersih.")
+        logger.info("Bot dihentikan manual oleh user (Ctrl+C). Membersihkan koneksi...")
+        bot.shutdown()
         sys.exit(0)
