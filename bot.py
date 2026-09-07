@@ -2,15 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot - Ultimate Institutional Masterpiece (24/5 Ready)
-Features: Kalman Filter, MTF Trend, Session Filter, Semi-AI Confidence, Circuit Breaker, & Dynamic S/R TP
+Production-Ready XAUUSD Deriv Bot - Masterpiece v6 (Fixed Edition)
+Features: Kalman Filter, MTF Trend, Session Filter, Semi-AI Confidence,
+Circuit Breaker, Dynamic S/R TP.
+
+Perbaikan pada versi ini dibanding v5:
+  1. Candle cache tidak lagi ter-corrupt oleh update live/forming candle
+     (tidak ada lagi repainting akibat duplikasi candle yang belum closed).
+  2. Normalisasi field waktu candle (epoch vs open_time) dari dua sumber
+     data Deriv yang berbeda format.
+  3. Reconnect WebSocket tidak lagi rekursif (tidak menumpuk call stack).
+  4. Notifikasi error/disconnect punya cooldown terpisah supaya tidak
+     membanjiri Telegram saat koneksi tidak stabil.
 """
 
 import os
 import sys
 import time
 import json
-import math
 import logging
 import websocket
 import requests
@@ -34,6 +43,7 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("FATAL: Telegram Token atau Chat ID belum disetel di environment variables!")
     sys.exit(1)
 
+
 # ==========================================
 # SISTEM TELEGRAM NOTIFIKASI ANTI-SPAM
 # ==========================================
@@ -42,8 +52,14 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+
         self.last_signal_time = 0
-        self.cooldown_period = 300  # Cooldown 5 menit anti-spam
+        self.cooldown_period = 300  # Cooldown 5 menit untuk sinyal trading
+
+        # Cooldown TERPISAH untuk notifikasi error/disconnect,
+        # supaya koneksi yang goyah tidak membanjiri Telegram.
+        self.last_error_time = 0
+        self.error_cooldown_period = 600  # 10 menit
 
     def send_message(self, text: str, force: bool = False) -> bool:
         current_time = time.time()
@@ -70,10 +86,28 @@ class TelegramNotifier:
             logger.error(f"Exception saat mengirim pesan Telegram: {e}")
             return False
 
+    def send_alert(self, text: str) -> bool:
+        """
+        Khusus untuk alert sistem (error/disconnect). Punya cooldown sendiri
+        (error_cooldown_period) supaya tidak spam saat koneksi flapping,
+        beda dengan cooldown sinyal trading.
+        """
+        current_time = time.time()
+        if current_time - self.last_error_time < self.error_cooldown_period:
+            logger.info("Alert sistem ditahan oleh cooldown alert (mencegah spam).")
+            return False
+        sent = self.send_message(text, force=True)
+        if sent:
+            self.last_error_time = current_time
+        return sent
+
+
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
 
 # ==========================================
 # MODUL KUANTITATIF & INSTITUTIONAL ENGINE
+# (logika perhitungan tidak diubah dari versi asli)
 # ==========================================
 class MasterpieceQuantitativeEngine:
     @staticmethod
@@ -84,7 +118,7 @@ class MasterpieceQuantitativeEngine:
         for i in range(1, len(candles)):
             high = float(candles[i]['high'])
             low = float(candles[i]['low'])
-            close_prev = float(candles[i-1]['close'])
+            close_prev = float(candles[i - 1]['close'])
             tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
             true_ranges.append(tr)
         return sum(true_ranges[-period:]) / period
@@ -98,15 +132,15 @@ class MasterpieceQuantitativeEngine:
 
     @staticmethod
     def kalman_filter_update(price: float, state_estimate: float, error_covariance: float) -> tuple:
-        q = 1e-5  
-        r = 1e-2  
+        q = 1e-5
+        r = 1e-2
         state_predict = state_estimate
         cov_predict = error_covariance + q
-        
+
         kalman_gain = cov_predict / (cov_predict + r)
         state_estimate = state_predict + kalman_gain * (price - state_predict)
         error_covariance = (1 - kalman_gain) * cov_predict
-        
+
         return state_estimate, error_covariance
 
     @staticmethod
@@ -115,7 +149,7 @@ class MasterpieceQuantitativeEngine:
             return "NEUTRAL"
         macro_sma_fast = sum([float(c['close']) for c in candles[-20:]]) / 20
         macro_sma_slow = sum([float(c['close']) for c in candles[-60:]]) / 60
-        
+
         if macro_sma_fast > macro_sma_slow:
             return "BULLISH"
         elif macro_sma_fast < macro_sma_slow:
@@ -126,8 +160,8 @@ class MasterpieceQuantitativeEngine:
     def check_volatility_circuit_breaker(candles: list, current_atr: float) -> bool:
         """
         Volatility Circuit Breaker (News Spike Shield):
-        Mengembalikan True jika ATR saat ini melompat > 2.2x dari rata-rata ATR 10 candle sebelumnya,
-        menandakan adanya rilis berita ekstrem (NFP/CPI) yang berbahaya bagi scalping.
+        True jika ATR saat ini melompat > 2.2x dari rata-rata ATR 10 candle
+        sebelumnya (indikasi rilis berita ekstrem seperti NFP/CPI).
         """
         if len(candles) < 25:
             return False
@@ -135,35 +169,30 @@ class MasterpieceQuantitativeEngine:
         for i in range(10, 20):
             sub_candles = candles[:-i] if i > 0 else candles
             past_atrs.append(MasterpieceQuantitativeEngine.calculate_atr(sub_candles, period=14))
-        
+
         if not past_atrs:
             return False
         avg_past_atr = sum(past_atrs) / len(past_atrs)
-        
+
         if avg_past_atr > 0 and current_atr > (avg_past_atr * 2.2):
-            return True # Circuit Breaker Aktif (Pasar Berbahaya)
+            return True
         return False
 
     @staticmethod
     def get_dynamic_swing_tp(candles: list, entry_price: float, direction: str, atr: float) -> float:
         """
-        Dynamic Support/Resistance Take Profit (TP):
-        Mencari level swing high/low lokal dari 20 candle terakhir untuk penempatan TP optimal.
+        Dynamic Support/Resistance Take Profit (TP) dari swing 20 candle terakhir.
         """
         if len(candles) < 20:
             return entry_price + (atr * 1.5) if direction == "BUY" else entry_price - (atr * 1.5)
-            
+
         recent_candles = candles[-20:]
         if direction == "BUY":
-            # Cari resistance lokal tertinggi di masa lalu dekat
             local_resistance = max([float(c['high']) for c in recent_candles])
-            calculated_tp = max(entry_price + (atr * 1.5), local_resistance - (atr * 0.2))
-            return calculated_tp
+            return max(entry_price + (atr * 1.5), local_resistance - (atr * 0.2))
         else:
-            # Cari support lokal terendah di masa lalu dekat
             local_support = min([float(c['low']) for c in recent_candles])
-            calculated_tp = min(entry_price - (atr * 1.5), local_support + (atr * 0.2))
-            return calculated_tp
+            return min(entry_price - (atr * 1.5), local_support + (atr * 0.2))
 
     @staticmethod
     def evaluate_confidence(candles: list, deviation: float, atr: float) -> float:
@@ -171,13 +200,14 @@ class MasterpieceQuantitativeEngine:
             return 0.0
         recent = candles[-5:]
         body_momentum = sum([abs(float(c['close']) - float(c['open'])) for c in recent]) / 5
-        
+
         volatility_score = min(1.0, atr / 5.0)
-        deviation_score = min(1.0, abs(deviation) / (atr * 1.5))
+        deviation_score = min(1.0, abs(deviation) / (atr * 1.5)) if atr > 0 else 0.0
         momentum_score = min(1.0, body_momentum / atr) if atr > 0 else 0.5
-        
+
         confidence = (deviation_score * 0.4) + (momentum_score * 0.4) + (volatility_score * 0.2)
         return round(confidence * 100, 2)
+
 
 # ==========================================
 # FILTER SESI LIKUIDITAS TINGGI (WIB)
@@ -187,17 +217,36 @@ def is_market_active_and_liquid() -> bool:
     now_wib = now_utc.astimezone(timezone(timedelta(hours=7)))
     weekday = now_wib.weekday()
     hour = now_wib.hour
-    
+
     if weekday == 5 and hour >= 5:
         return False
     if weekday == 6:
         return False
     if weekday == 0 and hour < 5:
         return False
-        
+
     if 13 <= hour < 23:
         return True
     return False
+
+
+def normalize_candle(raw: dict) -> dict:
+    """
+    Menyamakan format candle dari dua sumber Deriv yang berbeda:
+    - Endpoint history ("candles"): pakai key 'epoch'
+    - Stream live ("ohlc"): pakai key 'open_time'
+    Tanpa normalisasi ini, perbandingan waktu candle antara data historis
+    dan data live akan salah/KeyError.
+    """
+    time_key = raw.get("open_time", raw.get("epoch"))
+    return {
+        "time": time_key,
+        "open": float(raw.get("open", 0)),
+        "high": float(raw.get("high", 0)),
+        "low": float(raw.get("low", 0)),
+        "close": float(raw.get("close", 0)),
+    }
+
 
 # ==========================================
 # DERIV WEBSOCKET CLIENT & MAIN EXECUTION
@@ -207,7 +256,8 @@ class DerivTradingBotMasterpiece:
         self.ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
         self.symbol = "frxXAUUSD"
         self.granularity = 300  # M5
-        self.candles_cache = []
+        self.candles_cache = []       # hanya berisi candle yang SUDAH CLOSE
+        self.current_forming_candle = None  # candle yang sedang berjalan (belum close)
         self.kalman_state = 0.0
         self.kalman_cov = 1.0
         self.is_initialized = False
@@ -216,74 +266,85 @@ class DerivTradingBotMasterpiece:
         try:
             data = json.loads(message)
             msg_type = data.get("msg_type")
-            
+
             if msg_type == "ohlc":
-                candle = data.get("ohlc", {})
-                close_price = float(candle.get("close", 0))
-                high_price = float(candle.get("high", 0))
-                low_price = float(candle.get("low", 0))
-                
-                self.candles_cache.append({
-                    "time": candle.get("open_time"),
-                    "open": float(candle.get("open", 0)),
-                    "high": high_price,
-                    "low": low_price,
-                    "close": close_price
-                })
-                
-                if len(self.candles_cache) > 120:
-                    self.candles_cache.pop(0)
-                    
-                self.run_quantitative_analysis(close_price)
-                
+                raw_candle = data.get("ohlc", {})
+                candle = normalize_candle(raw_candle)
+
+                if self.current_forming_candle is None:
+                    self.current_forming_candle = candle
+
+                elif candle["time"] == self.current_forming_candle["time"]:
+                    # Candle yang sama, masih dalam proses (belum closed).
+                    # Update in-place, JANGAN di-append supaya cache historis
+                    # tidak terkontaminasi duplikat candle yang belum final.
+                    self.current_forming_candle = candle
+
+                else:
+                    # open_time berubah -> candle sebelumnya sudah CLOSE.
+                    self.candles_cache.append(self.current_forming_candle)
+                    if len(self.candles_cache) > 120:
+                        self.candles_cache.pop(0)
+                    self.current_forming_candle = candle
+
+                # Analisis tetap jalan tiap tick pakai harga live saat ini,
+                # tapi seluruh histori (candles_cache) tetap bersih & stabil.
+                self.run_quantitative_analysis(candle["close"])
+
             elif msg_type == "candles":
-                self.candles_cache = data.get("candles", [])
+                raw_candles = data.get("candles", [])
+                self.candles_cache = [normalize_candle(c) for c in raw_candles]
                 logger.info(f"Berhasil memuat {len(self.candles_cache)} data historis candle.")
                 if not self.is_initialized:
                     self.is_initialized = True
                     notifier.send_message(
-                        "🟢 *STARTUP NOTIFICATION (MASTERPIECE v5)*\n"
+                        "🟢 *STARTUP NOTIFICATION (MASTERPIECE v6 - Fixed)*\n"
                         "Sistem Bot XAUUSD M5 Aktif dengan Circuit Breaker, Dynamic TP, & MTF Engine.",
                         force=True
                     )
+
+            elif msg_type == "error":
+                logger.error(f"Deriv API error: {data.get('error')}")
+
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 
     def on_error(self, ws, error):
+        # Hanya log di sini. Notifikasi dikirim di on_close (yang akan
+        # selalu terpanggil setelah on_error), supaya tidak dobel alert.
         logger.error(f"WebSocket Error: {error}")
-        notifier.send_message(
-            "⚠️ *ERROR / SYSTEM FAILURE ALERT*\n"
-            f"Koneksi WebSocket mengalami gangguan error: `{error}`",
-            force=True
-        )
 
     def on_close(self, ws, close_status_code, close_msg):
-        logger.warning("WebSocket terputus. Melakukan auto-reconnect dalam 5 detik...")
-        notifier.send_message(
-            "⚠️ *ERROR / SYSTEM FAILURE ALERT*\n"
-            "Koneksi WebSocket terputus dari server Deriv. Melakukan auto-reconnect bersih...",
-            force=True
+        logger.warning(f"WebSocket terputus (code={close_status_code}). Auto-reconnect akan dilakukan oleh main loop.")
+        notifier.send_alert(
+            "⚠️ *SYSTEM ALERT*\n"
+            f"Koneksi WebSocket terputus dari server Deriv (`{close_status_code}`). "
+            "Mencoba menyambung kembali..."
         )
-        time.sleep(5)
-        self.start()
+        # PENTING: tidak memanggil self.start() di sini.
+        # Reconnect sepenuhnya ditangani oleh while-loop di start(),
+        # supaya tidak terjadi rekursi/penumpukan call stack.
 
     def on_open(self, ws):
         logger.info("Websocket connected to Deriv server.")
-        sub_payload = {
-            "ticks_history": self.symbol,
-            "adjust_start_time": 1,
-            "count": 120,
-            "end": "latest",
-            "granularity": self.granularity,
-            "style": "candles"
-        }
-        ws.send(json.dumps(sub_payload))
-        
-        sub_stream = {
-            "ohlc": self.symbol,
-            "granularity": self.granularity
-        }
-        ws.send(json.dumps(sub_stream))
+        try:
+            sub_payload = {
+                "ticks_history": self.symbol,
+                "adjust_start_time": 1,
+                "count": 120,
+                "end": "latest",
+                "granularity": self.granularity,
+                "style": "candles"
+            }
+            ws.send(json.dumps(sub_payload))
+
+            sub_stream = {
+                "ohlc": self.symbol,
+                "granularity": self.granularity
+            }
+            ws.send(json.dumps(sub_stream))
+        except Exception as e:
+            logger.error(f"Gagal mengirim subscription payload: {e}")
 
     def run_quantitative_analysis(self, current_close: float):
         if not is_market_active_and_liquid():
@@ -296,12 +357,10 @@ class DerivTradingBotMasterpiece:
         if atr == 0:
             return
 
-        # 1. Cek Circuit Breaker (Berita Ekstrem / Spike)
         if MasterpieceQuantitativeEngine.check_volatility_circuit_breaker(self.candles_cache, atr):
             logger.warning("CIRCUIT BREAKER AKTIF: Lonjakan volatilitas berita terdeteksi. Sinyal ditahan.")
             return
 
-        # 2. Kalman Filter Update
         if self.kalman_state == 0.0:
             self.kalman_state = current_close
         self.kalman_state, self.kalman_cov = MasterpieceQuantitativeEngine.kalman_filter_update(
@@ -310,20 +369,21 @@ class DerivTradingBotMasterpiece:
 
         sma_50 = MasterpieceQuantitativeEngine.calculate_sma(self.candles_cache, period=50)
         mtf_trend = MasterpieceQuantitativeEngine.check_higher_timeframe_trend(self.candles_cache)
-        confidence = MasterpieceQuantitativeEngine.evaluate_confidence(self.candles_cache, current_close - self.kalman_state, atr)
-        
+        confidence = MasterpieceQuantitativeEngine.evaluate_confidence(
+            self.candles_cache, current_close - self.kalman_state, atr
+        )
+
         deviation = current_close - self.kalman_state
         ultra_tight_sl_points = max(5.0, atr * 0.5)
         min_ai_threshold = 60.0
 
-        # Sinyal BUY Valid
         if deviation < -(atr * 0.85) and current_close >= sma_50 and mtf_trend == "BULLISH" and confidence >= min_ai_threshold:
             entry_price = current_close
             tp_price = MasterpieceQuantitativeEngine.get_dynamic_swing_tp(self.candles_cache, entry_price, "BUY", atr)
             sl_price = entry_price - ultra_tight_sl_points
             tp_points = abs(tp_price - entry_price)
-            
-            signal_msg = (
+
+            notifier.send_message(
                 f"🚀 *MASTERPIECE SIGNAL (BUY)*\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
                 f"• *MTF Macro Trend:* `BULLISH`\n"
@@ -332,16 +392,14 @@ class DerivTradingBotMasterpiece:
                 f"• *Dynamic TP:* `{tp_price:.2f}` (+{tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (-{ultra_tight_sl_points:.1f} Poin)"
             )
-            notifier.send_message(signal_msg)
 
-        # Sinyal SELL Valid
         elif deviation > (atr * 0.85) and current_close <= sma_50 and mtf_trend == "BEARISH" and confidence >= min_ai_threshold:
             entry_price = current_close
             tp_price = MasterpieceQuantitativeEngine.get_dynamic_swing_tp(self.candles_cache, entry_price, "SELL", atr)
             sl_price = entry_price + ultra_tight_sl_points
             tp_points = abs(entry_price - tp_price)
-            
-            signal_msg = (
+
+            notifier.send_message(
                 f"🚀 *MASTERPIECE SIGNAL (SELL)*\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
                 f"• *MTF Macro Trend:* `BEARISH`\n"
@@ -350,7 +408,6 @@ class DerivTradingBotMasterpiece:
                 f"• *Dynamic TP:* `{tp_price:.2f}` (-{tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (+{ultra_tight_sl_points:.1f} Poin)"
             )
-            notifier.send_message(signal_msg)
 
     def start(self):
         while True:
@@ -368,11 +425,21 @@ class DerivTradingBotMasterpiece:
                     on_close=self.on_close
                 )
                 ws.run_forever(ping_interval=15, ping_timeout=10)
-                
+                # ws.run_forever() baru return setelah koneksi benar-benar putus.
+                # Reset state candle supaya tidak ada gap/duplikasi waktu candle
+                # yang salah setelah reconnect.
+                self.current_forming_candle = None
+                time.sleep(5)
+
             except Exception as e:
                 logger.error(f"Critical error in main loop: {e}")
                 time.sleep(5)
 
+
 if __name__ == "__main__":
     bot = DerivTradingBotMasterpiece()
-    bot.start()
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        logger.info("Bot dihentikan manual oleh user (Ctrl+C). Keluar dengan bersih.")
+        sys.exit(0)
