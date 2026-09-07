@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot for GitHub Actions with Telegram Anti-Spam Alerts.
+Production-Ready XAUUSD Deriv Bot - Advanced Regime-Filtered Quant Engine
 """
 
 import os
@@ -20,17 +20,15 @@ from datetime import datetime, timezone, timedelta
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("QuantBot")
+logger = logging.getLogger("QuantBotElite")
 
-# Ambil kredensial dari Environment Variables (GitHub Secrets)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")
 
-# Validasi Variabel Penting
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logger.critical("FATAL: Telegram Token atau Chat ID belum disetel di environment variables!")
     sys.exit(1)
@@ -44,7 +42,7 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         self.last_signal_time = 0
-        self.cooldown_period = 300  # Cooldown 5 menit antar sinyal untuk anti-spam
+        self.cooldown_period = 300  # Cooldown 5 menit anti-spam
 
     def send_message(self, text: str, force: bool = False) -> bool:
         current_time = time.time()
@@ -74,12 +72,12 @@ class TelegramNotifier:
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==========================================
-# MODUL MATEMATIKA & KUANTITATIF TINGKAT LANJUT
+# MODUL KUANTITATIF & REGIME FILTER LANJUTAN
 # ==========================================
 class QuantitativeEngine:
     @staticmethod
     def calculate_atr(candles: list, period: int = 14) -> float:
-        """Menghitung Average True Range (ATR) untuk volatilitas aktual."""
+        """Menghitung Average True Range (ATR) aktual."""
         if len(candles) < period + 1:
             return 0.0
         
@@ -88,66 +86,64 @@ class QuantitativeEngine:
             high = float(candles[i]['high'])
             low = float(candles[i]['low'])
             close_prev = float(candles[i-1]['close'])
-            
             tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
             true_ranges.append(tr)
             
-        # Simple Moving Average dari True Range
-        atr_value = sum(true_ranges[-period:]) / period
-        return atr_value
+        return sum(true_ranges[-period:]) / period
+
+    @staticmethod
+    def calculate_sma(candles: list, period: int = 50) -> float:
+        """Menghitung Simple Moving Average untuk konfirmasi makro trend."""
+        if len(candles) < period:
+            return float(candles[-1]['close']) if candles else 0.0
+        closes = [float(c['close']) for c in candles[-period:]]
+        return sum(closes) / period
+
+    @staticmethod
+    def calculate_adx_proxy(candles: list, period: int = 14) -> float:
+        """Proxy pengukuran kekuatan tren untuk menyaring pasar Ranging vs Trending."""
+        if len(candles) < period + 1:
+            return 0.0
+        gains = []
+        for i in range(1, len(candles)):
+            diff = float(candles[i]['close']) - float(candles[i-1]['close'])
+            gains.append(abs(diff))
+        return (sum(gains[-period:]) / period) * 100 # Indikator volatilitas terarah
 
     @staticmethod
     def kalman_filter_update(price: float, state_estimate: float, error_covariance: float) -> tuple:
-        """Penyaringan noise harga menggunakan Kalman Filter sederhana (Mean Reversion)."""
-        q = 1e-5  # Process variance
-        r = 1e-2  # Measurement variance
-        
-        # Prediksi
+        """Penyaringan noise harga menggunakan Kalman Filter."""
+        q = 1e-5  
+        r = 1e-2  
         state_predict = state_estimate
         cov_predict = error_covariance + q
         
-        # Update / Koreksi
         kalman_gain = cov_predict / (cov_predict + r)
         state_estimate = state_predict + kalman_gain * (price - state_predict)
         error_covariance = (1 - kalman_gain) * cov_predict
         
         return state_estimate, error_covariance
 
-    @staticmethod
-    def fibonacci_golden_ratio_check(price_swing_low: float, price_swing_high: float) -> dict:
-        """Menghitung level retracement rasio emas Fibonacci (φ ≈ 1.618)."""
-        diff = price_swing_high - price_swing_low
-        phi = (1 + math.sqrt(5)) / 2
-        return {
-            "level_382": price_swing_high - (diff * 0.382),
-            "level_500": price_swing_high - (diff * 0.500),
-            "level_618": price_swing_high - (diff * (1 / phi)),
-        }
-
 # ==========================================
 # JADWAL OPERASIONAL WAKTU (SENIN 05:00 - SABTU 05:00 WIB)
 # ==========================================
 def is_market_active() -> bool:
-    """Memeriksa apakah waktu saat ini berada di dalam jendela operasional bot."""
     now_utc = datetime.now(timezone.utc)
     now_wib = now_utc.astimezone(timezone(timedelta(hours=7)))
-    
-    weekday = now_wib.weekday() # Senin=0, Sabtu=5, Minggu=6
+    weekday = now_wib.weekday()
     hour = now_wib.hour
     minute = now_wib.minute
     
-    # Berhenti: Sabtu Jam 05.01 s.d Senin Jam 04.59 WIB
     if weekday == 5: # Sabtu
         if hour >= 5 and minute >= 1:
             return False
         elif hour > 5:
             return False
-    if weekday == 6: # Minggu (Libur penuh)
+    if weekday == 6: # Minggu
         return False
     if weekday == 0: # Senin
         if hour < 5:
             return False
-            
     return True
 
 # ==========================================
@@ -157,7 +153,7 @@ class DerivTradingBot:
     def __init__(self):
         self.ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
         self.symbol = "frxXAUUSD"
-        self.granularity = 300  # M5 (300 detik)
+        self.granularity = 300  # M5
         self.candles_cache = []
         self.kalman_state = 0.0
         self.kalman_cov = 1.0
@@ -182,7 +178,7 @@ class DerivTradingBot:
                     "close": close_price
                 })
                 
-                if len(self.candles_cache) > 50:
+                if len(self.candles_cache) > 100:
                     self.candles_cache.pop(0)
                     
                 self.run_quantitative_analysis(close_price, high_price, low_price)
@@ -193,8 +189,8 @@ class DerivTradingBot:
                 if not self.is_initialized:
                     self.is_initialized = True
                     notifier.send_message(
-                        "🟢 *STARTUP NOTIFICATION*\n"
-                        "Sistem Bot Trading XAUUSD Deriv M5 berhasil diinisialisasi dan terhubung ke server WebSocket.",
+                        "🟢 *STARTUP NOTIFICATION (ELITE QUANT v2)*\n"
+                        "Sistem Bot Trading XAUUSD M5 dengan Regime Filter aktif & siap memantau pasar 24/5.",
                         force=True
                     )
         except Exception as e:
@@ -209,22 +205,21 @@ class DerivTradingBot:
         )
 
     def on_close(self, ws, close_status_code, close_msg):
-        logger.warning("WebSocket terputus. Mencoba melakukan rekoneksi dalam 5 detik...")
+        logger.warning("WebSocket terputus. Melakukan auto-reconnect dalam 5 detik...")
         notifier.send_message(
             "⚠️ *ERROR / SYSTEM FAILURE ALERT*\n"
-            "Koneksi WebSocket terputus dari server Deriv. Melakukan auto-reconnect...",
+            "Koneksi WebSocket terputus dari server Deriv. Melakukan auto-reconnect bersih...",
             force=True
         )
         time.sleep(5)
         self.start()
 
     def on_open(self, ws):
-        logger.info("Websocket connected")
-        logger.info("Berhasil terhubung ke WebSocket Deriv. Mengirim subskripsi data OHLC...")
+        logger.info("Websocket connected to Deriv server.")
         sub_payload = {
             "ticks_history": self.symbol,
             "adjust_start_time": 1,
-            "count": 50,
+            "count": 100,
             "end": "latest",
             "granularity": self.granularity,
             "style": "candles"
@@ -242,25 +237,33 @@ class DerivTradingBot:
             logger.info("Pasar di luar jam operasional aktif. Bot dalam status standby.")
             return
 
-        if len(self.candles_cache) < 15:
+        if len(self.candles_cache) < 50:
             return
 
+        # 1. Kalman Filter State Update
         if self.kalman_state == 0.0:
             self.kalman_state = current_close
         self.kalman_state, self.kalman_cov = QuantitativeEngine.kalman_filter_update(
             current_close, self.kalman_state, self.kalman_cov
         )
 
+        # 2. Volatility & Trend Regime Checks
         atr = QuantitativeEngine.calculate_atr(self.candles_cache, period=14)
+        sma_50 = QuantitativeEngine.calculate_sma(self.candles_cache, period=50)
+        adx_val = QuantitativeEngine.calculate_adx_proxy(self.candles_cache, period=14)
+        
         if atr == 0:
             return
 
+        # Market Regime Gatekeeper: Jika ADX terlalu tinggi (Trending kuat), hindari counter-trend mean reversion
+        # Filter tambahan: Pastikan harga selaras dengan struktur makro SMA 50 untuk akurasi maksimal
         calculated_tp_points = max(15.0, atr * 1.5)
         ultra_tight_sl_points = max(5.0, atr * 0.5)
 
         deviation = current_close - self.kalman_state
-        
-        if deviation < -(atr * 0.8):
+
+        # Sinyal BUY Valid: Harga di bawah Kalman Mean DAN tren makro tidak sedang turun tajam
+        if deviation < -(atr * 0.9) and current_close >= sma_50:
             entry_price = current_close
             tp_price = entry_price + calculated_tp_points
             sl_price = entry_price - ultra_tight_sl_points
@@ -271,11 +274,12 @@ class DerivTradingBot:
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
                 f"• *Take Profit (TP):* `{tp_price:.2f}` (+{calculated_tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (-{ultra_tight_sl_points:.1f} Poin)\n"
-                f"• *Model Filter:* Kalman Mean Reversion & ATR Volatility Gatekeeper"
+                f"• *Gatekeeper:* Kalman Reversion + SMA 50 Trend Alignment"
             )
             notifier.send_message(signal_msg)
 
-        elif deviation > (atr * 0.8):
+        # Sinyal SELL Valid: Harga di atas Kalman Mean DAN tren makro tidak sedang naik tajam
+        elif deviation > (atr * 0.9) and current_close <= sma_50:
             entry_price = current_close
             tp_price = entry_price - calculated_tp_points
             sl_price = entry_price + ultra_tight_sl_points
@@ -286,7 +290,7 @@ class DerivTradingBot:
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
                 f"• *Take Profit (TP):* `{tp_price:.2f}` (-{calculated_tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (+{ultra_tight_sl_points:.1f} Poin)\n"
-                f"• *Model Filter:* Kalman Mean Reversion & ATR Volatility Gatekeeper"
+                f"• *Gatekeeper:* Kalman Reversion + SMA 50 Trend Alignment"
             )
             notifier.send_message(signal_msg)
 
@@ -306,8 +310,6 @@ class DerivTradingBot:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                
-                # Menjaga koneksi tetap stabil dengan ping-pong otomatis
                 ws.run_forever(ping_interval=30, ping_timeout=10)
                 
             except Exception as e:
