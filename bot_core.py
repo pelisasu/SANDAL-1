@@ -46,6 +46,7 @@ MIN_IMPULSE_VECTOR = float(os.getenv("MIN_IMPULSE_VECTOR", "0.6"))
 H1_REFRESH_SECONDS = 1800  # 30 menit
 
 # req_id untuk mencocokkan response WS dengan request yang dikirim
+REQ_ID_ACTIVE_SYMBOLS = 100
 REQ_ID_H1 = 101
 REQ_ID_M5_SEED = 102
 
@@ -412,6 +413,33 @@ class QuantSignalEngine:
         await self.notifier.send(msg)
 
     # ---------------- WS REQUEST HELPERS ----------------
+    async def _check_symbol_availability(self, ws):
+        """Preflight check: minta daftar active_symbols dan cari mana yang
+        cocok dengan SYMBOL / mengandung 'XAU'. app_id publik tertentu bisa
+        saja tidak punya akses ke instrumen komoditas tergantung landing
+        company/region yang terikat padanya, sehingga simbol yang secara
+        sintaks benar (mis. frxXAUUSD) tetap bisa ditolak dengan
+        InvalidSymbol. Hasil pengecekan ini hanya di-log, tidak mengubah
+        alur program."""
+        req = {"active_symbols": "brief", "product_type": "basic", "req_id": REQ_ID_ACTIVE_SYMBOLS}
+        await ws.send(json.dumps(req))
+
+    def _handle_active_symbols_response(self, msg):
+        symbols = msg.get("active_symbols", [])
+        names = {s.get("symbol") for s in symbols}
+        if SYMBOL in names:
+            logger.info(f"[SYMBOL CHECK] '{SYMBOL}' TERSEDIA untuk app_id ini.")
+        else:
+            gold_like = sorted(
+                s.get("symbol") for s in symbols
+                if "XAU" in (s.get("symbol") or "") or "gold" in (s.get("display_name") or "").lower()
+            )
+            logger.error(
+                f"[SYMBOL CHECK] '{SYMBOL}' TIDAK ADA di daftar active_symbols untuk app_id/region ini. "
+                f"Kandidat simbol emas yang tersedia: {gold_like if gold_like else '(tidak ditemukan satupun)'}. "
+                f"Set env TARGET_SYMBOL ke salah satu kandidat di atas, atau gunakan app_id/akun dengan akses komoditas."
+            )
+
     async def _fetch_h1_candles(self, ws):
         req = {
             "ticks_history": SYMBOL,
@@ -455,6 +483,7 @@ class QuantSignalEngine:
                     logger.info("[WS] Terhubung ke Gateway Publik Deriv.")
 
                     self.forming_candle = None
+                    await self._check_symbol_availability(ws)
                     await self._fetch_h1_candles(ws)
                     await self._fetch_m5_seed_and_subscribe(ws)
                     self.last_h1_refresh = time.time()
@@ -464,13 +493,22 @@ class QuantSignalEngine:
                             break
 
                         msg = json.loads(raw_msg)
+                        req_id = msg.get("req_id")
 
                         if msg.get("error"):
-                            logger.error(f"[DERIV API ERROR] {msg['error']}")
+                            which = {
+                                REQ_ID_ACTIVE_SYMBOLS: "active_symbols (preflight)",
+                                REQ_ID_H1: "H1 candles fetch",
+                                REQ_ID_M5_SEED: "M5 seed + subscribe",
+                            }.get(req_id, f"req_id={req_id} (tidak dikenal)")
+                            logger.error(f"[DERIV API ERROR] request='{which}' -> {msg['error']}")
                             continue
 
                         msg_type = msg.get("msg_type")
-                        req_id = msg.get("req_id")
+
+                        if msg_type == "active_symbols":
+                            self._handle_active_symbols_response(msg)
+                            continue
 
                         if msg_type == "candles":
                             if req_id == REQ_ID_H1:
