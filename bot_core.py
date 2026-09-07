@@ -427,7 +427,7 @@ class QuantSignalEngine:
         sintaks benar (mis. frxXAUUSD) tetap bisa ditolak dengan
         InvalidSymbol. Hasil pengecekan ini hanya di-log, tidak mengubah
         alur program."""
-        req = {"active_symbols": "brief", "product_type": "basic", "req_id": REQ_ID_ACTIVE_SYMBOLS}
+        req = {"active_symbols": "brief", "req_id": REQ_ID_ACTIVE_SYMBOLS}
         await ws.send(json.dumps(req))
 
     def _handle_active_symbols_response(self, msg):
@@ -449,12 +449,10 @@ class QuantSignalEngine:
                 sym_name(s) for s in symbols
                 if "XAU" in (sym_name(s) or "") or "gold" in disp_name(s).lower()
             })
-            logger.warning(
-                f"[SYMBOL CHECK] '{SYMBOL}' tidak ditemukan literal di daftar active_symbols "
-                f"(total {len(symbols)} simbol diterima). Kandidat emas: "
-                f"{gold_like if gold_like else '(tidak ditemukan satupun)'}. "
-                f"Ini bisa juga sekadar false-negative kalau server mem-filter accountless request; "
-                f"karena fetch histori untuk '{SYMBOL}' sudah terbukti sukses, ini tidak dianggap fatal."
+            logger.info(
+                f"[SYMBOL CHECK] '{SYMBOL}' tidak ditemukan literal di active_symbols "
+                f"(total {len(symbols)} simbol diterima) — ini hanya diagnostik non-fatal. "
+                f"Kandidat emas lain: {gold_like if gold_like else '(tidak ditemukan satupun)'}."
             )
 
     async def _fetch_h1_candles(self, ws):
@@ -473,7 +471,13 @@ class QuantSignalEngine:
         """One-off history fetch (TANPA subscribe) — dipoll berkala dari
         _periodic_poller alih-alih memakai push subscription real-time,
         karena subscribe:1 untuk simbol ini terbukti ditolak (InvalidSymbol)
-        walau one-off fetch untuk simbol yang sama berhasil."""
+        walau one-off fetch untuk simbol yang sama berhasil.
+
+        PENTING: gateway ini memakai skema lama di mana field 'subscribe'
+        HANYA menerima nilai 1 ('Not in enum list: 1' jika diisi 0). Untuk
+        request one-off, field 'subscribe' harus benar-benar DIHILANGKAN
+        (bukan diisi 0) — persis seperti request H1 yang sudah terbukti
+        berhasil sejak awal."""
         req = {
             "ticks_history": SYMBOL,
             "adjust_start_time": 1,
@@ -481,7 +485,6 @@ class QuantSignalEngine:
             "end": "latest",
             "style": "candles",
             "granularity": GRANULARITY_M5,
-            "subscribe": 0,
             "req_id": REQ_ID_M5,
         }
         await ws.send(json.dumps(req))
