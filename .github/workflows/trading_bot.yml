@@ -3,8 +3,8 @@ name: XAUUSD Deriv Quant Bot
 on:
   workflow_dispatch:
   schedule:
-    # Berjalan otomatis setiap hari kerja atau pemicu berkala
-    - cron: '0 * * * *'
+    # Berjalan otomatis setiap 5 jam sekali agar bot lebih stabil dan minim restart
+    - cron: '0 */5 * * *'
 
 jobs:
   run-bot:
