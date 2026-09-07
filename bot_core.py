@@ -45,10 +45,17 @@ MIN_IMPULSE_VECTOR = float(os.getenv("MIN_IMPULSE_VECTOR", "0.6"))
 # WS bertahan lama tanpa reconnect.
 H1_REFRESH_SECONDS = 1800  # 30 menit
 
+# Poll M5 pakai one-off ticks_history (TANPA subscribe) tiap N detik, bukan
+# real-time push subscription. Ini menghindari error 'InvalidSymbol' yang
+# muncul khusus saat mengirim subscribe:1 untuk simbol komoditas (gold) di
+# app_id publik yang tidak diotorisasi untuk live-stream komoditas, padahal
+# one-off history fetch untuk simbol yang sama terbukti berhasil.
+M5_POLL_SECONDS = int(os.getenv("M5_POLL_SECONDS", "10"))
+
 # req_id untuk mencocokkan response WS dengan request yang dikirim
 REQ_ID_ACTIVE_SYMBOLS = 100
 REQ_ID_H1 = 101
-REQ_ID_M5_SEED = 102
+REQ_ID_M5 = 102
 
 STATE_FILE = os.getenv("STATE_FILE", "active_trade_state.json")
 
@@ -180,7 +187,6 @@ class QuantSignalEngine:
 
         self.m5_candles = []
         self.h1_candles = []
-        self.forming_candle = None      # candle M5 yang sedang berjalan (belum closed)
         self.active_trade = None
         self.last_h1_refresh = 0.0
 
@@ -426,18 +432,29 @@ class QuantSignalEngine:
 
     def _handle_active_symbols_response(self, msg):
         symbols = msg.get("active_symbols", [])
-        names = {s.get("symbol") for s in symbols}
+
+        def sym_name(s):
+            # API lama pakai field 'symbol', API baru pakai 'underlying_symbol'.
+            return s.get("symbol") or s.get("underlying_symbol")
+
+        def disp_name(s):
+            return (s.get("display_name") or s.get("underlying_symbol_name") or "")
+
+        names = {sym_name(s) for s in symbols}
         if SYMBOL in names:
-            logger.info(f"[SYMBOL CHECK] '{SYMBOL}' TERSEDIA untuk app_id ini.")
+            logger.info(f"[SYMBOL CHECK] '{SYMBOL}' TERSEDIA di active_symbols untuk app_id ini "
+                        f"(fetch histori terbukti jalan; masalah subscribe live-stream ditangani via polling).")
         else:
-            gold_like = sorted(
-                s.get("symbol") for s in symbols
-                if "XAU" in (s.get("symbol") or "") or "gold" in (s.get("display_name") or "").lower()
-            )
-            logger.error(
-                f"[SYMBOL CHECK] '{SYMBOL}' TIDAK ADA di daftar active_symbols untuk app_id/region ini. "
-                f"Kandidat simbol emas yang tersedia: {gold_like if gold_like else '(tidak ditemukan satupun)'}. "
-                f"Set env TARGET_SYMBOL ke salah satu kandidat di atas, atau gunakan app_id/akun dengan akses komoditas."
+            gold_like = sorted({
+                sym_name(s) for s in symbols
+                if "XAU" in (sym_name(s) or "") or "gold" in disp_name(s).lower()
+            })
+            logger.warning(
+                f"[SYMBOL CHECK] '{SYMBOL}' tidak ditemukan literal di daftar active_symbols "
+                f"(total {len(symbols)} simbol diterima). Kandidat emas: "
+                f"{gold_like if gold_like else '(tidak ditemukan satupun)'}. "
+                f"Ini bisa juga sekadar false-negative kalau server mem-filter accountless request; "
+                f"karena fetch histori untuk '{SYMBOL}' sudah terbukti sukses, ini tidak dianggap fatal."
             )
 
     async def _fetch_h1_candles(self, ws):
@@ -452,7 +469,11 @@ class QuantSignalEngine:
         }
         await ws.send(json.dumps(req))
 
-    async def _fetch_m5_seed_and_subscribe(self, ws):
+    async def _fetch_m5_candles(self, ws):
+        """One-off history fetch (TANPA subscribe) — dipoll berkala dari
+        _periodic_poller alih-alih memakai push subscription real-time,
+        karena subscribe:1 untuk simbol ini terbukti ditolak (InvalidSymbol)
+        walau one-off fetch untuk simbol yang sama berhasil."""
         req = {
             "ticks_history": SYMBOL,
             "adjust_start_time": 1,
@@ -460,10 +481,27 @@ class QuantSignalEngine:
             "end": "latest",
             "style": "candles",
             "granularity": GRANULARITY_M5,
-            "subscribe": 1,
-            "req_id": REQ_ID_M5_SEED,
+            "subscribe": 0,
+            "req_id": REQ_ID_M5,
         }
         await ws.send(json.dumps(req))
+
+    async def _periodic_poller(self, ws):
+        """Task latar belakang: poll M5 tiap M5_POLL_SECONDS, dan refresh H1
+        tiap H1_REFRESH_SECONDS, selama market masih aktif & koneksi hidup."""
+        try:
+            while True:
+                await asyncio.sleep(M5_POLL_SECONDS)
+                if not self.is_market_active_wib():
+                    return
+                await self._fetch_m5_candles(ws)
+                if time.time() - self.last_h1_refresh >= H1_REFRESH_SECONDS:
+                    await self._fetch_h1_candles(ws)
+                    self.last_h1_refresh = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[POLLER ERROR] {e}")
 
     # ---------------- MAIN LOOP ----------------
     async def run(self):
@@ -482,71 +520,70 @@ class QuantSignalEngine:
                 async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=15) as ws:
                     logger.info("[WS] Terhubung ke Gateway Publik Deriv.")
 
-                    self.forming_candle = None
+                    self.m5_candles = []
                     await self._check_symbol_availability(ws)
                     await self._fetch_h1_candles(ws)
-                    await self._fetch_m5_seed_and_subscribe(ws)
                     self.last_h1_refresh = time.time()
+                    await self._fetch_m5_candles(ws)
 
-                    async for raw_msg in ws:
-                        if not self.is_market_active_wib():
-                            break
+                    poller_task = asyncio.create_task(self._periodic_poller(ws))
+                    try:
+                        async for raw_msg in ws:
+                            if not self.is_market_active_wib():
+                                break
 
-                        msg = json.loads(raw_msg)
-                        req_id = msg.get("req_id")
+                            msg = json.loads(raw_msg)
+                            req_id = msg.get("req_id")
 
-                        if msg.get("error"):
-                            which = {
-                                REQ_ID_ACTIVE_SYMBOLS: "active_symbols (preflight)",
-                                REQ_ID_H1: "H1 candles fetch",
-                                REQ_ID_M5_SEED: "M5 seed + subscribe",
-                            }.get(req_id, f"req_id={req_id} (tidak dikenal)")
-                            logger.error(f"[DERIV API ERROR] request='{which}' -> {msg['error']}")
-                            continue
+                            if msg.get("error"):
+                                which = {
+                                    REQ_ID_ACTIVE_SYMBOLS: "active_symbols (preflight)",
+                                    REQ_ID_H1: "H1 candles fetch",
+                                    REQ_ID_M5: "M5 candles poll",
+                                }.get(req_id, f"req_id={req_id} (tidak dikenal)")
+                                logger.error(f"[DERIV API ERROR] request='{which}' -> {msg['error']}")
+                                continue
 
-                        msg_type = msg.get("msg_type")
+                            msg_type = msg.get("msg_type")
 
-                        if msg_type == "active_symbols":
-                            self._handle_active_symbols_response(msg)
-                            continue
+                            if msg_type == "active_symbols":
+                                self._handle_active_symbols_response(msg)
+                                continue
 
-                        if msg_type == "candles":
+                            if msg_type != "candles":
+                                continue
+
                             if req_id == REQ_ID_H1:
                                 self.h1_candles = msg.get("candles", [])
                                 logger.info(f"[H1] Data makro diperbarui ({len(self.h1_candles)} candle).")
-                            elif req_id == REQ_ID_M5_SEED:
-                                self.m5_candles = msg.get("candles", [])
-                                self.forming_candle = None
-                                logger.info(f"[M5] Seed data dimuat ({len(self.m5_candles)} candle).")
-                            continue
+                                continue
 
-                        if msg_type == "ohlc" or "ohlc" in msg:
-                            ohlc = msg["ohlc"]
-                            epoch = int(ohlc["open_time"])
-                            o, h, l, c = (
-                                float(ohlc["open"]), float(ohlc["high"]),
-                                float(ohlc["low"]), float(ohlc["close"]),
+                            if req_id != REQ_ID_M5:
+                                continue
+
+                            new_candles = msg.get("candles", [])
+                            if not new_candles:
+                                continue
+
+                            if not self.m5_candles:
+                                # Fetch pertama: simpan apa adanya, tidak ada "candle baru" untuk diproses.
+                                self.m5_candles = new_candles[-80:]
+                                logger.info(f"[M5] Seed data dimuat ({len(self.m5_candles)} candle).")
+                                continue
+
+                            # Elemen terakhir array bisa jadi candle yang masih terbentuk
+                            # (belum pasti closed) — hanya proses candle SEBELUM itu yang
+                            # epoch-nya belum pernah kita lihat.
+                            known_epochs = {c["epoch"] for c in self.m5_candles}
+                            closed_candidates = new_candles[:-1] if len(new_candles) > 1 else []
+                            newly_closed = sorted(
+                                (c for c in closed_candidates if c["epoch"] not in known_epochs),
+                                key=lambda c: c["epoch"],
                             )
 
-                            if self.forming_candle is None:
-                                self.forming_candle = {"epoch": epoch, "open": o, "high": h, "low": l, "close": c}
+                            self.m5_candles = new_candles[-80:]
 
-                            elif epoch == self.forming_candle["epoch"]:
-                                # Masih candle yang sama sedang terbentuk -> update in-place
-                                self.forming_candle["high"] = h
-                                self.forming_candle["low"] = l
-                                self.forming_candle["close"] = c
-
-                            else:
-                                # Epoch berubah -> candle forming sebelumnya BENAR-BENAR closed.
-                                closed_candle = self.forming_candle
-                                self.m5_candles.append(closed_candle)
-                                if len(self.m5_candles) > 80:
-                                    self.m5_candles.pop(0)
-
-                                # Mulai candle baru yang sedang terbentuk
-                                self.forming_candle = {"epoch": epoch, "open": o, "high": h, "low": l, "close": c}
-
+                            for closed_candle in newly_closed:
                                 await self.manage_active_trade(closed_candle)
 
                                 if not self.active_trade:
@@ -559,11 +596,12 @@ class QuantSignalEngine:
                                             self.active_trade = setup
                                             self._save_state()
                                             await self.broadcast_signal(setup)
-
-                                # Refresh H1 macro filter secara berkala agar tidak basi
-                                if time.time() - self.last_h1_refresh >= H1_REFRESH_SECONDS:
-                                    await self._fetch_h1_candles(ws)
-                                    self.last_h1_refresh = time.time()
+                    finally:
+                        poller_task.cancel()
+                        try:
+                            await poller_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
             except Exception as e:
                 logger.error(f"[RECONNECTING] WebSocket: {e}")
