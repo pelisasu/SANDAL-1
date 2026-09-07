@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot - Multi-Timeframe (MTF) Advanced Quant Engine (24/5 Ready)
+Production-Ready XAUUSD Deriv Bot - Ultimate Institutional Masterpiece (24/5 Ready)
+Features: Kalman Filter, MTF Trend, Session Filter, Semi-AI Confidence, Circuit Breaker, & Dynamic S/R TP
 """
 
 import os
@@ -23,7 +24,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("QuantBotAdvancedMTF")
+logger = logging.getLogger("QuantBotMasterpiece")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -72,9 +73,9 @@ class TelegramNotifier:
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 # ==========================================
-# MODUL KUANTITATIF & MTF ENGINE
+# MODUL KUANTITATIF & INSTITUTIONAL ENGINE
 # ==========================================
-class AdvancedQuantitativeEngine:
+class MasterpieceQuantitativeEngine:
     @staticmethod
     def calculate_atr(candles: list, period: int = 14) -> float:
         if len(candles) < period + 1:
@@ -110,14 +111,8 @@ class AdvancedQuantitativeEngine:
 
     @staticmethod
     def check_higher_timeframe_trend(candles: list) -> str:
-        """
-        Simulasi Multi-Timeframe (MTF) Trend Filter:
-        Menganalisis blok candle agregat besar untuk menentukan arah tren makro (BULLISH / BEARISH).
-        """
         if len(candles) < 60:
             return "NEUTRAL"
-        
-        # Agregasi data M5 menjadi struktur tren yang lebih besar
         macro_sma_fast = sum([float(c['close']) for c in candles[-20:]]) / 20
         macro_sma_slow = sum([float(c['close']) for c in candles[-60:]]) / 60
         
@@ -126,6 +121,49 @@ class AdvancedQuantitativeEngine:
         elif macro_sma_fast < macro_sma_slow:
             return "BEARISH"
         return "NEUTRAL"
+
+    @staticmethod
+    def check_volatility_circuit_breaker(candles: list, current_atr: float) -> bool:
+        """
+        Volatility Circuit Breaker (News Spike Shield):
+        Mengembalikan True jika ATR saat ini melompat > 2.2x dari rata-rata ATR 10 candle sebelumnya,
+        menandakan adanya rilis berita ekstrem (NFP/CPI) yang berbahaya bagi scalping.
+        """
+        if len(candles) < 25:
+            return False
+        past_atrs = []
+        for i in range(10, 20):
+            sub_candles = candles[:-i] if i > 0 else candles
+            past_atrs.append(MasterpieceQuantitativeEngine.calculate_atr(sub_candles, period=14))
+        
+        if not past_atrs:
+            return False
+        avg_past_atr = sum(past_atrs) / len(past_atrs)
+        
+        if avg_past_atr > 0 and current_atr > (avg_past_atr * 2.2):
+            return True # Circuit Breaker Aktif (Pasar Berbahaya)
+        return False
+
+    @staticmethod
+    def get_dynamic_swing_tp(candles: list, entry_price: float, direction: str, atr: float) -> float:
+        """
+        Dynamic Support/Resistance Take Profit (TP):
+        Mencari level swing high/low lokal dari 20 candle terakhir untuk penempatan TP optimal.
+        """
+        if len(candles) < 20:
+            return entry_price + (atr * 1.5) if direction == "BUY" else entry_price - (atr * 1.5)
+            
+        recent_candles = candles[-20:]
+        if direction == "BUY":
+            # Cari resistance lokal tertinggi di masa lalu dekat
+            local_resistance = max([float(c['high']) for c in recent_candles])
+            calculated_tp = max(entry_price + (atr * 1.5), local_resistance - (atr * 0.2))
+            return calculated_tp
+        else:
+            # Cari support lokal terendah di masa lalu dekat
+            local_support = min([float(c['low']) for c in recent_candles])
+            calculated_tp = min(entry_price - (atr * 1.5), local_support + (atr * 0.2))
+            return calculated_tp
 
     @staticmethod
     def evaluate_confidence(candles: list, deviation: float, atr: float) -> float:
@@ -157,7 +195,6 @@ def is_market_active_and_liquid() -> bool:
     if weekday == 0 and hour < 5:
         return False
         
-    # Sesi Likuiditas Optimal XAUUSD (13:00 - 23:00 WIB)
     if 13 <= hour < 23:
         return True
     return False
@@ -165,7 +202,7 @@ def is_market_active_and_liquid() -> bool:
 # ==========================================
 # DERIV WEBSOCKET CLIENT & MAIN EXECUTION
 # ==========================================
-class DerivTradingBotMTF:
+class DerivTradingBotMasterpiece:
     def __init__(self):
         self.ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
         self.symbol = "frxXAUUSD"
@@ -205,8 +242,8 @@ class DerivTradingBotMTF:
                 if not self.is_initialized:
                     self.is_initialized = True
                     notifier.send_message(
-                        "🟢 *STARTUP NOTIFICATION (MTF QUANT ELITE)*\n"
-                        "Sistem Bot XAUUSD M5 Aktif dengan Multi-Timeframe Trend & Kalman Engine.",
+                        "🟢 *STARTUP NOTIFICATION (MASTERPIECE v5)*\n"
+                        "Sistem Bot XAUUSD M5 Aktif dengan Circuit Breaker, Dynamic TP, & MTF Engine.",
                         force=True
                     )
         except Exception as e:
@@ -255,57 +292,62 @@ class DerivTradingBotMTF:
         if len(self.candles_cache) < 60:
             return
 
-        # 1. Kalman Filter Update
-        if self.kalman_state == 0.0:
-            self.kalman_state = current_close
-        self.kalman_state, self.kalman_cov = AdvancedQuantitativeEngine.kalman_filter_update(
-            current_close, self.kalman_state, self.kalman_cov
-        )
-
-        # 2. Indikator & Multi-Timeframe Check
-        atr = AdvancedQuantitativeEngine.calculate_atr(self.candles_cache, period=14)
-        sma_50 = AdvancedQuantitativeEngine.calculate_sma(self.candles_cache, period=50)
-        mtf_trend = AdvancedQuantitativeEngine.check_higher_timeframe_trend(self.candles_cache)
-        confidence = AdvancedQuantitativeEngine.evaluate_confidence(self.candles_cache, current_close - self.kalman_state, atr)
-        
+        atr = MasterpieceQuantitativeEngine.calculate_atr(self.candles_cache, period=14)
         if atr == 0:
             return
 
+        # 1. Cek Circuit Breaker (Berita Ekstrem / Spike)
+        if MasterpieceQuantitativeEngine.check_volatility_circuit_breaker(self.candles_cache, atr):
+            logger.warning("CIRCUIT BREAKER AKTIF: Lonjakan volatilitas berita terdeteksi. Sinyal ditahan.")
+            return
+
+        # 2. Kalman Filter Update
+        if self.kalman_state == 0.0:
+            self.kalman_state = current_close
+        self.kalman_state, self.kalman_cov = MasterpieceQuantitativeEngine.kalman_filter_update(
+            current_close, self.kalman_state, self.kalman_cov
+        )
+
+        sma_50 = MasterpieceQuantitativeEngine.calculate_sma(self.candles_cache, period=50)
+        mtf_trend = MasterpieceQuantitativeEngine.check_higher_timeframe_trend(self.candles_cache)
+        confidence = MasterpieceQuantitativeEngine.evaluate_confidence(self.candles_cache, current_close - self.kalman_state, atr)
+        
         deviation = current_close - self.kalman_state
-        calculated_tp_points = max(15.0, atr * 1.5)
         ultra_tight_sl_points = max(5.0, atr * 0.5)
         min_ai_threshold = 60.0
 
-        # Sinyal BUY Valid (Didukung MTF Bullish)
+        # Sinyal BUY Valid
         if deviation < -(atr * 0.85) and current_close >= sma_50 and mtf_trend == "BULLISH" and confidence >= min_ai_threshold:
             entry_price = current_close
-            tp_price = entry_price + calculated_tp_points
+            tp_price = MasterpieceQuantitativeEngine.get_dynamic_swing_tp(self.candles_cache, entry_price, "BUY", atr)
             sl_price = entry_price - ultra_tight_sl_points
+            tp_points = abs(tp_price - entry_price)
             
             signal_msg = (
-                f"🚀 *MTF VALID SIGNAL (BUY)*\n"
+                f"🚀 *MASTERPIECE SIGNAL (BUY)*\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
                 f"• *MTF Macro Trend:* `BULLISH`\n"
                 f"• *Confidence Score:* `{confidence}%`\n"
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
-                f"• *Take Profit (TP):* `{tp_price:.2f}` (+{calculated_tp_points:.1f} Poin)\n"
+                f"• *Dynamic TP:* `{tp_price:.2f}` (+{tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (-{ultra_tight_sl_points:.1f} Poin)"
             )
             notifier.send_message(signal_msg)
 
-        # Sinyal SELL Valid (Didukung MTF Bearish)
+        # Sinyal SELL Valid
         elif deviation > (atr * 0.85) and current_close <= sma_50 and mtf_trend == "BEARISH" and confidence >= min_ai_threshold:
             entry_price = current_close
-            tp_price = entry_price - calculated_tp_points
+            tp_price = MasterpieceQuantitativeEngine.get_dynamic_swing_tp(self.candles_cache, entry_price, "SELL", atr)
             sl_price = entry_price + ultra_tight_sl_points
+            tp_points = abs(entry_price - tp_price)
             
             signal_msg = (
-                f"🚀 *MTF VALID SIGNAL (SELL)*\n"
+                f"🚀 *MASTERPIECE SIGNAL (SELL)*\n"
                 f"• *Instrumen:* XAUUSD (M5)\n"
                 f"• *MTF Macro Trend:* `BEARISH`\n"
                 f"• *Confidence Score:* `{confidence}%`\n"
                 f"• *Entry Price:* `{entry_price:.2f}`\n"
-                f"• *Take Profit (TP):* `{tp_price:.2f}` (-{calculated_tp_points:.1f} Poin)\n"
+                f"• *Dynamic TP:* `{tp_price:.2f}` (-{tp_points:.1f} Poin)\n"
                 f"• *Stop Loss (SL):* `{sl_price:.2f}` (+{ultra_tight_sl_points:.1f} Poin)"
             )
             notifier.send_message(signal_msg)
@@ -317,7 +359,7 @@ class DerivTradingBotMTF:
                     time.sleep(1800)
                     continue
 
-                logger.info("Menghubungkan ke server WebSocket Deriv (MTF Engine)...")
+                logger.info("Menghubungkan ke server WebSocket Deriv (Masterpiece Engine)...")
                 ws = websocket.WebSocketApp(
                     self.ws_url,
                     on_open=self.on_open,
@@ -332,5 +374,5 @@ class DerivTradingBotMTF:
                 time.sleep(5)
 
 if __name__ == "__main__":
-    bot = DerivTradingBotMTF()
+    bot = DerivTradingBotMasterpiece()
     bot.start()
