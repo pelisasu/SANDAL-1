@@ -1,0 +1,56 @@
+name: Titan Supreme Quant Engine
+
+on:
+  schedule:
+    # Cadangan fail-safe setiap 6 jam jika rotasi sempat terputus
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+# Hak akses wajib agar runner dapat memicu siklus berikutnya
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: quant-singleton-engine
+  cancel-in-progress: false
+
+jobs:
+  execute-titan-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python Production Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Quant Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Engine with Lifetime Guard
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_SYMBOL: "frxXAUUSD"
+        run: |
+          # Eksekusi selama 19200 detik (5 jam 20 menit) sebelum pergantian runner secara bersih
+          timeout --preserve-status 19200s python bot_core.py || true
+
+      - name: Self-Trigger Next Rotation (Continuous Loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Memulai siklus runner berikutnya..."
+          gh workflow run "Titan Supreme Quant Engine" --ref main || true
