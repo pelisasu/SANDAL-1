@@ -99,7 +99,6 @@ class QuantitativeEngine:
     @staticmethod
     def kalman_filter_update(price: float, state_estimate: float, error_covariance: float) -> tuple:
         """Penyaringan noise harga menggunakan Kalman Filter sederhana (Mean Reversion)."""
-        # Parameter proses
         q = 1e-5  # Process variance
         r = 1e-2  # Measurement variance
         
@@ -122,7 +121,7 @@ class QuantitativeEngine:
         return {
             "level_382": price_swing_high - (diff * 0.382),
             "level_500": price_swing_high - (diff * 0.500),
-            "level_618": price_swing_high - (diff * (1 / phi)), # 0.618 rasio emas
+            "level_618": price_swing_high - (diff * (1 / phi)),
         }
 
 # ==========================================
@@ -131,10 +130,9 @@ class QuantitativeEngine:
 def is_market_active() -> bool:
     """Memeriksa apakah waktu saat ini berada di dalam jendela operasional bot."""
     now_utc = datetime.now(timezone.utc)
-    # Konversi ke WIB (UTC+7)
     now_wib = now_utc.astimezone(timezone(timedelta(hours=7)))
     
-    weekday = now_wib.weekday() # Senin=0, Selasa=1, ..., Sabtu=5, Minggu=6
+    weekday = now_wib.weekday() # Senin=0, Sabtu=5, Minggu=6
     hour = now_wib.hour
     minute = now_wib.minute
     
@@ -176,7 +174,6 @@ class DerivTradingBot:
                 high_price = float(candle.get("high", 0))
                 low_price = float(candle.get("low", 0))
                 
-                # Simpan ke cache lokal
                 self.candles_cache.append({
                     "time": candle.get("open_time"),
                     "open": float(candle.get("open", 0)),
@@ -186,9 +183,8 @@ class DerivTradingBot:
                 })
                 
                 if len(self.candles_cache) > 50:
-                    self.candles_cache.pop(0) # Batasi memori cache
+                    self.candles_cache.pop(0)
                     
-                # Jalankan Logika Analisis Kuantitatif
                 self.run_quantitative_analysis(close_price, high_price, low_price)
                 
             elif msg_type == "candles":
@@ -223,6 +219,7 @@ class DerivTradingBot:
         self.start()
 
     def on_open(self, ws):
+        logger.info("Websocket connected")
         logger.info("Berhasil terhubung ke WebSocket Deriv. Mengirim subskripsi data OHLC...")
         sub_payload = {
             "ticks_history": self.symbol,
@@ -234,7 +231,6 @@ class DerivTradingBot:
         }
         ws.send(json.dumps(sub_payload))
         
-        # Subscribe streaming real-time candle
         sub_stream = {
             "ohlc": self.symbol,
             "granularity": self.granularity
@@ -242,7 +238,6 @@ class DerivTradingBot:
         ws.send(json.dumps(sub_stream))
 
     def run_quantitative_analysis(self, current_close: float, high: float, low: float):
-        """Inti model kuantitatif: Kalman Filter, ATR Volatility, dan Filter Sinyal Presisi."""
         if not is_market_active():
             logger.info("Pasar di luar jam operasional aktif. Bot dalam status standby.")
             return
@@ -250,26 +245,21 @@ class DerivTradingBot:
         if len(self.candles_cache) < 15:
             return
 
-        # 1. Update Kalman Filter
         if self.kalman_state == 0.0:
             self.kalman_state = current_close
         self.kalman_state, self.kalman_cov = QuantitativeEngine.kalman_filter_update(
             current_close, self.kalman_state, self.kalman_cov
         )
 
-        # 2. Hitung ATR untuk TP Dinamis dan SL Ultra-Tipis
         atr = QuantitativeEngine.calculate_atr(self.candles_cache, period=14)
         if atr == 0:
             return
 
-        # Syarat Mutlak TP minimal 15 Poin (1.5 USD pergerakan XAUUSD bersih)
         calculated_tp_points = max(15.0, atr * 1.5)
         ultra_tight_sl_points = max(5.0, atr * 0.5)
 
-        # 3. Logika Deteksi Sinyal Berbasis Deviasi Mean Reversion & Order Flow Slices
         deviation = current_close - self.kalman_state
         
-        # Sinyal BUY Valid (Deviasi negatif ekstrem dari Kalman Mean)
         if deviation < -(atr * 0.8):
             entry_price = current_close
             tp_price = entry_price + calculated_tp_points
@@ -285,7 +275,6 @@ class DerivTradingBot:
             )
             notifier.send_message(signal_msg)
 
-        # Sinyal SELL Valid (Deviasi positif ekstrem dari Kalman Mean)
         elif deviation > (atr * 0.8):
             entry_price = current_close
             tp_price = entry_price - calculated_tp_points
@@ -317,7 +306,10 @@ class DerivTradingBot:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                ws.run_forever()
+                
+                # Menjaga koneksi tetap stabil dengan ping-pong otomatis
+                ws.run_forever(ping_interval=30, ping_timeout=10)
+                
             except Exception as e:
                 logger.error(f"Critical error in main loop: {e}")
                 time.sleep(10)
