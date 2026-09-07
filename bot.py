@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 LEAD QUANTITATIVE & ALGORITHMIC TRADING SYSTEMS ARCHITECT
-Production-Ready XAUUSD Deriv Bot - Advanced Regime-Filtered Quant Engine
+Production-Ready XAUUSD Deriv Bot - Ultimate Regime-Filtered Quant Engine (24/5 Ready)
 """
 
 import os
@@ -98,17 +98,6 @@ class QuantitativeEngine:
             return float(candles[-1]['close']) if candles else 0.0
         closes = [float(c['close']) for c in candles[-period:]]
         return sum(closes) / period
-
-    @staticmethod
-    def calculate_adx_proxy(candles: list, period: int = 14) -> float:
-        """Proxy pengukuran kekuatan tren untuk menyaring pasar Ranging vs Trending."""
-        if len(candles) < period + 1:
-            return 0.0
-        gains = []
-        for i in range(1, len(candles)):
-            diff = float(candles[i]['close']) - float(candles[i-1]['close'])
-            gains.append(abs(diff))
-        return (sum(gains[-period:]) / period) * 100 # Indikator volatilitas terarah
 
     @staticmethod
     def kalman_filter_update(price: float, state_estimate: float, error_covariance: float) -> tuple:
@@ -250,19 +239,16 @@ class DerivTradingBot:
         # 2. Volatility & Trend Regime Checks
         atr = QuantitativeEngine.calculate_atr(self.candles_cache, period=14)
         sma_50 = QuantitativeEngine.calculate_sma(self.candles_cache, period=50)
-        adx_val = QuantitativeEngine.calculate_adx_proxy(self.candles_cache, period=14)
         
         if atr == 0:
             return
 
-        # Market Regime Gatekeeper: Jika ADX terlalu tinggi (Trending kuat), hindari counter-trend mean reversion
-        # Filter tambahan: Pastikan harga selaras dengan struktur makro SMA 50 untuk akurasi maksimal
         calculated_tp_points = max(15.0, atr * 1.5)
         ultra_tight_sl_points = max(5.0, atr * 0.5)
 
         deviation = current_close - self.kalman_state
 
-        # Sinyal BUY Valid: Harga di bawah Kalman Mean DAN tren makro tidak sedang turun tajam
+        # Sinyal BUY Valid: Harga di bawah Kalman Mean DAN tren makro mendukung
         if deviation < -(atr * 0.9) and current_close >= sma_50:
             entry_price = current_close
             tp_price = entry_price + calculated_tp_points
@@ -278,7 +264,7 @@ class DerivTradingBot:
             )
             notifier.send_message(signal_msg)
 
-        # Sinyal SELL Valid: Harga di atas Kalman Mean DAN tren makro tidak sedang naik tajam
+        # Sinyal SELL Valid: Harga di atas Kalman Mean DAN tren makro mendukung
         elif deviation > (atr * 0.9) and current_close <= sma_50:
             entry_price = current_close
             tp_price = entry_price - calculated_tp_points
@@ -310,11 +296,13 @@ class DerivTradingBot:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                
+                # Jaga koneksi stabil dengan ping interval 15 detik
+                ws.run_forever(ping_interval=15, ping_timeout=10)
                 
             except Exception as e:
                 logger.error(f"Critical error in main loop: {e}")
-                time.sleep(10)
+                time.sleep(5)
 
 if __name__ == "__main__":
     bot = DerivTradingBot()
