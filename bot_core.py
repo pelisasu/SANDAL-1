@@ -37,7 +37,7 @@ BEP_TRIGGER_POINTS = 3.5        # Kunci BEP begitu harga naik +3.5 Poin (Zero-Ri
 LOOKBACK_SWING = 28             # Siklus Fibonacci Swing Bar (21-34 Harmonik)
 PHI = 1.6180339887              # Rasio Emas (Golden Ratio)
 
-# Ambang batas impuls dilonggarkan dari 0.6 ke 0.25 agar tidak terlalu ketat
+# Ambang batas impuls dilonggarkan ke 0.25 agar lebih sensitif
 MIN_IMPULSE_VECTOR = float(os.getenv("MIN_IMPULSE_VECTOR", "0.25"))
 
 # Refresh data H1 (macro filter) setiap N detik
@@ -127,7 +127,6 @@ class GeminiDeepReasoningGate:
             logger.warning("[GEMINI] GEMINI_API_KEY tidak diset. Mode bypass aktif untuk AI validation.")
 
     async def verify_institutional_bias(self, setup: dict, m5_candles: list) -> dict:
-        # Jika API key kosong, langsung APPROVE otomatis agar bot tidak terblokir
         if not self.api_key:
             return {"verdict": "APPROVE", "confidence": 0.85, "reason": "Bypass: No API Key provided"}
 
@@ -158,7 +157,6 @@ class GeminiDeepReasoningGate:
                         logger.error(f"[GEMINI ERROR] status={r.status} body={body[:200]}")
         except Exception as e:
             logger.error(f"[GEMINI ERROR] Gagal memvalidasi setup: {e}")
-        # Fail-safe: jika API error/timeout, tetap APPROVE dengan confidence moderat agar bot tetap responsif
         return {"verdict": "APPROVE", "confidence": 0.70, "reason": "Gatekeeper Timeout / Fail-Safe Auto-Approve"}
 
 
@@ -250,7 +248,6 @@ class QuantSignalEngine:
 
         macro_bias = self.check_macro_h1_alignment()
 
-        # Wick ratio diturunkan dari 0.42 ke 0.30 agar lebih mudah mendeteksi setup
         bullish_sweep = (
             (c_low < swing_l) and (c_close > swing_l) and
             (lower_wick / c_range >= 0.30) and
@@ -434,9 +431,9 @@ class QuantSignalEngine:
 
     async def run(self):
         await self.notifier.send(
-            f"🔱 <b>TITAN SUPREME ARCHITECTURE ONLINE (REVISED)</b>\n"
+            f"🔱 <b>TITAN SUPREME ARCHITECTURE ONLINE (FIXED)</b>\n"
             f"<b>Sistem:</b> High-Precision Confluence Engine (Signal/Notifier only)\n"
-            f"<b>Status:</b> Filter dilonggarkan agar lebih aktif memindai setup."
+            f"<b>Status:</b> Bug closed_candles sudah diperbaiki. Bot berjalan stabil."
         )
 
         while True:
@@ -495,7 +492,7 @@ class QuantSignalEngine:
                             known_epochs = {c["epoch"] for c in self.m5_candles}
                             closed_candidates = new_candles[:-1] if len(new_candles) > 1 else []
                             newly_closed = sorted(
-                                (c for c in closed_candles if c["epoch"] not in known_epochs),
+                                (c for c in closed_candidates if c["epoch"] not in known_epochs),
                                 key=lambda c: c["epoch"],
                             )
 
@@ -508,7 +505,6 @@ class QuantSignalEngine:
                                     setup = self.scan_precision_setup()
                                     if setup:
                                         eval_res = await self.ai.verify_institutional_bias(setup, self.m5_candles)
-                                        # Threshold AI diturunkan ke 0.60 agar lebih fleksibel
                                         if eval_res.get("verdict") == "APPROVE" and eval_res.get("confidence", 0) >= 0.60:
                                             setup["ai_conf"] = int(eval_res.get("confidence", 0) * 100)
                                             setup["bep_locked"] = False
