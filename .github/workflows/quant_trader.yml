@@ -2,11 +2,9 @@ name: Titan Supreme Quant Engine
 
 on:
   schedule:
-    # Cadangan fail-safe setiap 6 jam jika rotasi sempat terputus
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *' # Fail-safe
   workflow_dispatch:
 
-# Hak akses wajib agar runner dapat memicu siklus berikutnya
 permissions:
   contents: write
   actions: write
@@ -37,6 +35,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore State (Anti Lupa Posisi)
+        run: |
+          if [ -f titan_v3_state.json ]; then
+            echo "State found from previous commit"
+            cat titan_v3_state.json
+          else
+            echo "No state, fresh start"
+          fi
+        continue-on-error: true
+
       - name: Run Engine with Lifetime Guard
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -44,13 +52,24 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_SYMBOL: "frxXAUUSD"
         run: |
-          # Eksekusi selama 19200 detik (5 jam 20 menit) sebelum pergantian runner secara bersih
           timeout --preserve-status 19200s python bot_core.py || true
 
-      - name: Self-Trigger Next Rotation (Continuous Loop)
+      - name: Save State to Repo (Biar Gak Hilang Pas Rotasi)
+        if: always()
+        run: |
+          git config --global user.name "Titan Bot"
+          git config --global user.email "bot@titan.quant"
+          if [ -f titan_v3_state.json ]; then
+            git add titan_v3_state.json
+            git diff --staged --quiet || git commit -m "chore: persist state [skip ci]"
+            git push origin main || echo "Push state failed, will retry next rotation"
+          fi
+
+      - name: Self-Trigger Next Rotation
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Memulai siklus runner berikutnya..."
+          echo "Triggering next rotation..."
+          sleep 10
           gh workflow run "Titan Supreme Quant Engine" --ref main || true
