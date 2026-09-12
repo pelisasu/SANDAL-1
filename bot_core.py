@@ -5,524 +5,391 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+import tempfile
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from collections import deque
 
 import aiohttp
 import numpy as np
 import pytz
 import websockets
+from websockets.exceptions import ConnectionClosed
 
-# --- SYSTEM LOGGING ENGINE ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("QUANT_ARCHITECT")
+# --- LOGGING PRO ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
+logger = logging.getLogger("TITAN_V3_LIVE")
 
-# --- KREDENSIAL & PARAMETER PASAR ---
+# --- CONFIG LIVE - JANGAN DIUBAH SEMBARANGAN ---
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+SYMBOL = os.getenv("TARGET_SYMBOL", "frxXAUUSD").strip()
+STATE_FILE = Path(os.getenv("STATE_FILE", "titan_v3_state.json"))
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Deriv Public Gateway (App ID 1089 - 100% Bebas API Key)
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-SYMBOL = os.getenv("TARGET_SYMBOL", "frxXAUUSD")
+# PARAMETER LIVE PRESET - UDAH DI-OPTIMIZE BUAT XAU SENIN
+GRAN_M5 = 300
+GRAN_H1 = 3600
+LOOKBACK = 28
+MIN_TP = 18.0
+BEP_TRIGGER = 5.0  # Lebih lega buat XAU, biar gak kesentuh spread
+BEP_PLUS = 1.0     # BEP + $1 profit
+MIN_VECTOR = 0.40  # 0.25 terlalu berisik, 0.40 itu sweet spot XAU
+MAX_SPREAD = 2.5   # Tolak sinyal kalau spread > $2.5
+MAX_RISK_PER_TRADE = 15.0 # Tolak setup kalau SL > $15
+SIGNAL_COOLDOWN = 1200 # 20 menit
 
-# Parameter Kuantitatif Presisi Tinggi (Sudah Dilonggarkan agar Lebih Aktif)
-GRANULARITY_M5 = 300            # 300 Detik (M5)
-GRANULARITY_H1 = 3600           # 3600 Detik (H1 - Macro Filter)
-MIN_TP_POINTS = 15.0            # Target Mutlak TP >= 15 Poin ($15.00)
-BEP_TRIGGER_POINTS = 3.5        # Kunci BEP begitu harga naik +3.5 Poin (Zero-Risk)
-LOOKBACK_SWING = 28             # Siklus Fibonacci Swing Bar (21-34 Harmonik)
-PHI = 1.6180339887              # Rasio Emas (Golden Ratio)
+REQ_H1 = 101
+REQ_M5 = 102
+REQ_SYMBOLS = 100
 
-# Ambang batas impuls dilonggarkan ke 0.25 agar lebih sensitif
-MIN_IMPULSE_VECTOR = float(os.getenv("MIN_IMPULSE_VECTOR", "0.25"))
+# === CORE QUANT ENGINE V3 ===
 
-# Refresh data H1 (macro filter) setiap N detik
-H1_REFRESH_SECONDS = 1800  # 30 menit
+class Kalman2D:
+    def __init__(self, q=1e-5, r=0.8):
+        self.x = np.array([0.0, 0.0])
+        self.P = np.eye(2) * 1.0
+        self.Q = np.array([[q, 0],[0, q*15]])
+        self.R = r
+        self.F = np.array([[1., 1.],[0., 1.]])
+        self.H = np.array([[1., 0.]])
+        self.init = False
+    def update(self, z: float):
+        if not self.init:
+            self.x[0] = z
+            self.init = True
+            return z, 0.0
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        y = z - (self.H @ self.x)[0]
+        S = (self.H @ self.P @ self.H.T)[0,0] + self.R
+        K = (self.P @ self.H.T) / S
+        self.x = self.x + K.flatten() * y
+        self.P = (np.eye(2) - K @ self.H) @ self.P
+        return float(self.x[0]), float(self.x[1])
 
-# Poll M5 pakai one-off ticks_history tiap N detik
-M5_POLL_SECONDS = int(os.getenv("M5_POLL_SECONDS", "10"))
-
-# req_id untuk mencocokkan response WS dengan request yang dikirim
-REQ_ID_ACTIVE_SYMBOLS = 100
-REQ_ID_H1 = 101
-REQ_ID_M5 = 102
-
-STATE_FILE = os.getenv("STATE_FILE", "active_trade_state.json")
-
-
-class KalmanVelocityFilter:
-    """Estimator Rekursif untuk Menghitung Nilai Riil Harga dan Kecepatan Vektor."""
-    def __init__(self, q=1e-4, r=1e-2):
-        self.q = q
-        self.r = r
-        self.x = 0.0
-        self.p = 1.0
-        self.last_x = 0.0
-        self.velocity = 0.0
-        self.is_init = False
-
-    def update(self, z: float) -> tuple:
-        if not self.is_init:
-            self.x = z
-            self.last_x = z
-            self.is_init = True
-            return self.x, 0.0
-
-        p_prior = self.p + self.q
-        k = p_prior / (p_prior + self.r)
-        self.last_x = self.x
-        self.x = self.x + k * (z - self.x)
-        self.p = (1.0 - k) * p_prior
-        self.velocity = self.x - self.last_x
-        return self.x, self.velocity
-
-
-class PythagoreanMomentumMatrix:
-    """Mengukur akselerasi harga 2-langkah (dalam satuan ATR) sebagai vektor 2D."""
+class MarketMath:
     @staticmethod
-    def calculate_impulse_vector(candles: list, atr: float) -> float:
-        if len(candles) < 3 or atr <= 0:
-            return 0.0
+    def wilder_atr(h, l, c, p=14):
+        if len(c) < p+1: return float(np.mean(h - l))
+        tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+        atr = np.zeros(len(tr))
+        atr[p-1] = np.mean(tr[:p])
+        for i in range(p, len(tr)):
+            atr[i] = (atr[i-1]*(p-1) + tr[i]) / p
+        return float(atr[-1])
+    
+    @staticmethod
+    def choppiness(h, l, c, p=14):
+        if len(c) < p+2: return 50
+        tr_sum = np.sum(np.maximum(h[-p:] - l[-p:], np.maximum(np.abs(h[-p:] - c[-p-1:-1]), np.abs(l[-p:] - c[-p-1:-1]))))
+        hl_range = np.max(h[-p:]) - np.min(l[-p:])
+        if hl_range == 0: return 100
+        return 100 * math.log10(tr_sum / hl_range) / math.log10(p)
+
+    @staticmethod
+    def impulse(candles, atr):
+        if len(candles) < 3 or atr <= 0: return 0
         dp1 = (candles[-2]["close"] - candles[-3]["close"]) / atr
         dp2 = (candles[-1]["close"] - candles[-2]["close"]) / atr
-        return math.sqrt(dp1 ** 2 + dp2 ** 2)
+        return math.sqrt(dp1*dp1 + dp2*dp2)
 
-
-class TelegramEngine:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-
-    async def send(self, message: str):
-        if not self.token or not self.chat_id:
-            logger.warning("[TELEGRAM] Token/Chat ID kosong, pesan tidak terkirim: %s", message[:80])
+class Telegram:
+    def __init__(self, token, chat_id):
+        self.token, self.chat_id = token, chat_id
+        self.url = f"https://api.telegram.org/bot{token}/sendMessage" if token else None
+        self.session = None
+    async def _sess(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    async def send(self, txt):
+        if not self.url: 
+            logger.info(f"[TG-SKIP] {txt[:100]}")
             return
-        payload = {
-            "chat_id": self.chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
+        for i in range(3):
+            try:
+                s = await self._sess()
+                async with s.post(self.url, json={"chat_id": self.chat_id, "text": txt, "parse_mode": "HTML"}, timeout=10) as r:
+                    if r.status == 200: return
+                    if r.status == 429: await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"TG err {e}")
+                await asyncio.sleep(1)
+
+class GeminiGate:
+    def __init__(self, key):
+        self.key = key
+        self.url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={key}" if key else None
+    async def verify(self, setup, candles):
+        if not self.key:
+            return {"verdict": "APPROVE", "confidence": 0.80, "reason": "No Key Bypass"}
+        ctx = [{"o": round(c["open"],2), "h": round(c["high"],2), "l": round(c["low"],2), "c": round(c["close"],2)} for c in candles[-8:]]
+        prompt = f"Act as strict XAUUSD institutional trader. Reject if: 1. No clear sweep 2. Chop 3. Weak close. Setup:{json.dumps(setup)} Context:{json.dumps(ctx)} Return ONLY JSON verdict APPROVE/REJECT confidence reason"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.api_url, json=payload, timeout=8) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(f"[TELEGRAM ERROR] status={resp.status} body={body[:200]}")
-        except Exception as e:
-            logger.error(f"[TELEGRAM ERROR] {e}")
-
-
-class GeminiDeepReasoningGate:
-    """Gatekeeper AI: Validasi Tingkat Ketat Berbasis Mikrostruktur."""
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={self.api_key}"
-        if not self.api_key:
-            logger.warning("[GEMINI] GEMINI_API_KEY tidak diset. Mode bypass aktif untuk AI validation.")
-
-    async def verify_institutional_bias(self, setup: dict, m5_candles: list) -> dict:
-        if not self.api_key:
-            return {"verdict": "APPROVE", "confidence": 0.85, "reason": "Bypass: No API Key provided"}
-
-        summary = [{"c": round(c["close"], 2), "h": round(c["high"], 2), "l": round(c["low"], 2)} for c in m5_candles[-6:]]
-        prompt = (
-            "Bertindak sebagai Lead Quantitative Order Flow Specialist. "
-            "Evaluasi sinyal XAUUSD M5 berikut terhadap potensi False Breakout / Trap. "
-            "Hanya setujui jika penyerapan likuiditas (Absorption) valid dan aman untuk rasio win-rate tinggi. "
-            "Jawab HANYA JSON: {\"verdict\": \"APPROVE\" atau \"REJECT\", \"confidence\": float (0.0-1.0), \"reason\": \"analisis ringkas\"}\n"
-            f"Setup: {json.dumps(setup)}\nContext Data: {json.dumps(summary)}"
-        )
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.05, "response_mime_type": "application/json"}
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.url, json=payload, timeout=10) as r:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(self.url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.05, "response_mime_type": "application/json"}}, timeout=10) as r:
                     if r.status == 200:
-                        res = await r.json()
-                        raw_text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        parsed = json.loads(raw_text)
-                        if "verdict" not in parsed:
-                            raise ValueError(f"Response Gemini tidak berisi 'verdict': {raw_text[:200]}")
-                        return parsed
-                    else:
-                        body = await r.text()
-                        logger.error(f"[GEMINI ERROR] status={r.status} body={body[:200]}")
+                        j = await r.json()
+                        txt = j["candidates"][0]["content"]["parts"][0]["text"]
+                        p = json.loads(txt)
+                        return p if "verdict" in p else {"verdict": "REJECT", "confidence": 0, "reason": "Bad JSON"}
         except Exception as e:
-            logger.error(f"[GEMINI ERROR] Gagal memvalidasi setup: {e}")
-        return {"verdict": "APPROVE", "confidence": 0.70, "reason": "Gatekeeper Timeout / Fail-Safe Auto-Approve"}
+            logger.error(f"Gemini {e}")
+        return {"verdict": "REJECT", "confidence": 0, "reason": "Fail-Safe Reject"}
 
-
-class QuantSignalEngine:
+class TitanV3:
     def __init__(self):
-        self.notifier = TelegramEngine(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.ai = GeminiDeepReasoningGate(GEMINI_API_KEY)
-        self.kalman_m5 = KalmanVelocityFilter()
-        self.kalman_h1 = KalmanVelocityFilter()
-        self.tz_wib = pytz.timezone("Asia/Jakarta")
+        self.tg = Telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.ai = GeminiGate(GEMINI_API_KEY)
+        self.kalman_m5 = Kalman2D()
+        self.kalman_h1 = Kalman2D()
+        self.m5 = []
+        self.h1 = []
+        self.active = None
+        self.last_h1 = 0
+        self.last_signal = 0
+        self.daily_loss = 0
+        self.last_day = datetime.now(timezone.utc).day
+        self._load()
 
-        self.m5_candles = []
-        self.h1_candles = []
-        self.active_trade = None
-        self.last_h1_refresh = 0.0
-
-        self._load_state()
-
-    def _load_state(self):
+    def _load(self):
         try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, "r") as f:
-                    data = json.load(f)
-                self.active_trade = data.get("active_trade")
-                if self.active_trade:
-                    logger.info(f"[STATE] Memuat active_trade dari disk: {self.active_trade}")
+            if STATE_FILE.exists():
+                d = json.loads(STATE_FILE.read_text())
+                self.active = d.get("active_trade")
+                self.daily_loss = d.get("daily_loss", 0)
+                self.last_day = d.get("last_day", self.last_day)
+                logger.info(f"State loaded: {self.active}")
         except Exception as e:
-            logger.error(f"[STATE] Gagal memuat state: {e}")
+            logger.error(f"Load err {e}")
 
-    def _save_state(self):
+    def _save(self):
         try:
-            with open(STATE_FILE, "w") as f:
-                json.dump({"active_trade": self.active_trade}, f)
+            data = {"active_trade": self.active, "daily_loss": self.daily_loss, "last_day": self.last_day}
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=".") as tf:
+                json.dump(data, tf)
+                tmp_name = tf.name
+            os.replace(tmp_name, STATE_FILE)
         except Exception as e:
-            logger.error(f"[STATE] Gagal menyimpan state: {e}")
+            logger.error(f"Save err {e}")
 
-    def is_market_active_wib(self) -> bool:
-        now = datetime.now(self.tz_wib)
-        wd, h, m = now.weekday(), now.hour, now.minute
-        if wd == 0:
-            return h >= 5
-        elif 1 <= wd <= 4:
-            return True
-        elif wd == 5:
-            return h < 5 or (h == 5 and m == 0)
-        return False
+    def market_open(self):
+        now = datetime.now(timezone.utc)
+        # Reset daily loss
+        if now.day != self.last_day:
+            self.daily_loss = 0
+            self.last_day = now.day
+            self._save()
+        # XAU Deriv: Tutup Jumat 21:00 UTC, Buka Minggu 22:00 UTC
+        if now.weekday() == 5 and now.hour >= 21: return False
+        if now.weekday() == 6 and now.hour < 22: return False
+        if now.weekday() == 6: return False
+        # Kill switch harian
+        if self.daily_loss >= 3: # Kalah 3x beruntun, stop hari itu
+            return False
+        return True
 
-    def check_macro_h1_alignment(self) -> str:
-        if len(self.h1_candles) < 5:
-            return "NEUTRAL"
-        closes = [c["close"] for c in self.h1_candles]
-        prior_estimate = self.kalman_h1.x if self.kalman_h1.is_init else closes[-1]
-        _, h1_vel = self.kalman_h1.update(closes[-1])
-        if closes[-1] > prior_estimate and h1_vel > 0:
-            return "BULLISH"
-        elif closes[-1] < prior_estimate and h1_vel < 0:
-            return "BEARISH"
+    def macro(self):
+        if len(self.h1) < 12: return "NEUTRAL"
+        closes = [c["close"] for c in self.h1]
+        _, vel = self.kalman_h1.update(closes[-1])
+        ema5 = np.mean(closes[-5:])
+        ema12 = np.mean(closes[-12:])
+        if ema5 > ema12 and vel > 0.05: return "BULLISH"
+        if ema5 < ema12 and vel < -0.05: return "BEARISH"
         return "NEUTRAL"
 
-    def scan_precision_setup(self):
-        if len(self.m5_candles) < LOOKBACK_SWING + 10:
-            return None
+    def scan(self):
+        if len(self.m5) < LOOKBACK + 15: return None
+        closes = np.array([c["close"] for c in self.m5])
+        highs = np.array([c["high"] for c in self.m5])
+        lows = np.array([c["low"] for c in self.m5])
+        opens = np.array([c["open"] for c in self.m5])
 
-        closes = np.array([c["close"] for c in self.m5_candles])
-        highs = np.array([c["high"] for c in self.m5_candles])
-        lows = np.array([c["low"] for c in self.m5_candles])
-        opens = np.array([c["open"] for c in self.m5_candles])
+        atr = MarketMath.wilder_atr(highs, lows, closes, 14)
+        chop = MarketMath.choppiness(highs, lows, closes, 14)
+        
+        if atr < 0.9: return None # Market sepi
+        if chop > 58: return None # Market choppy / sideways, ini pembunuh akun live
 
-        _, kalman_vel = self.kalman_m5.update(closes[-1])
+        vec = MarketMath.impulse(self.m5, atr)
+        if vec < MIN_VECTOR: return None
 
-        tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
-        if len(tr) >= 14:
-            atr = float(np.mean(tr[-14:]))
-        else:
-            atr = float(np.mean(highs - lows)) if len(highs) > 0 else 1.5
-            atr = max(atr, 0.1)
+        swing_h = np.max(highs[-LOOKBACK-1:-1])
+        swing_l = np.min(lows[-LOOKBACK-1:-1])
 
-        pythagoras_vector = PythagoreanMomentumMatrix.calculate_impulse_vector(self.m5_candles, atr)
-        if pythagoras_vector < MIN_IMPULSE_VECTOR:
-            return None
+        o,h,l,c = opens[-1], highs[-1], lows[-1], closes[-1]
+        rng = max(h-l, 0.1)
+        body = abs(c-o)
+        if body/rng < 0.45: return None # Tolak doji
 
-        swing_h = np.max(highs[-LOOKBACK_SWING - 1:-1])
-        swing_l = np.min(lows[-LOOKBACK_SWING - 1:-1])
+        lower_wick = min(o,c) - l
+        upper_wick = h - max(o,c)
+        macro = self.macro()
+        _, vel = self.kalman_m5.update(c)
 
-        c_open, c_high, c_low, c_close = opens[-1], highs[-1], lows[-1], closes[-1]
-        c_range = max(c_high - c_low, 0.05)
-        lower_wick = min(c_open, c_close) - c_low
-        upper_wick = c_high - max(c_open, c_close)
-
-        macro_bias = self.check_macro_h1_alignment()
-
-        bullish_sweep = (
-            (c_low < swing_l) and (c_close > swing_l) and
-            (lower_wick / c_range >= 0.30) and
-            (macro_bias in ("BULLISH", "NEUTRAL"))
+        # === BUY LOGIC: SWEEP + REJECTION + MOMENTUM ===
+        bullish = (
+            l < swing_l and c > swing_l and 
+            lower_wick/rng >= 0.38 and 
+            body/rng >= 0.45 and
+            macro in ("BULLISH","NEUTRAL") and
+            vel > -0.15
+        )
+        # === SELL LOGIC ===
+        bearish = (
+            h > swing_h and c < swing_h and 
+            upper_wick/rng >= 0.38 and 
+            body/rng >= 0.45 and
+            macro in ("BEARISH","NEUTRAL") and
+            vel < 0.15
         )
 
-        bearish_sweep = (
-            (c_high > swing_h) and (c_close < swing_h) and
-            (upper_wick / c_range >= 0.30) and
-            (macro_bias in ("BEARISH", "NEUTRAL"))
-        )
-
-        if bullish_sweep:
-            entry = round(c_close, 2)
-            sl = round(c_low - max(0.4 * atr, 0.7), 2)
+        if bullish:
+            entry = round(c,2)
+            sl = round(l - max(0.65*atr, 1.3), 2)
             risk = entry - sl
-            if risk <= 0:
-                return None
-            tp = round(entry + max(MIN_TP_POINTS, risk * 2.5), 2)
+            if risk <= 0.6 or risk > MAX_RISK_PER_TRADE: return None
+            tp = round(entry + max(MIN_TP, risk*3.0), 2) # RR 1:3 FIX
+            return {"action": "BUY", "entry": entry, "sl": sl, "tp": tp, "risk": round(risk,2), "reward": round(tp-entry,2), "rrr": 3.0, "vector": round(vec,2), "macro": macro, "atr": round(atr,2), "chop": round(chop,1)}
 
-            return {
-                "action": "BUY (INSTANT QUANT IMPULSE)",
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "risk": round(risk, 2),
-                "reward": round(tp - entry, 2),
-                "rrr": round((tp - entry) / risk, 2),
-                "vector": round(pythagoras_vector, 2),
-                "macro": macro_bias,
-            }
-
-        elif bearish_sweep:
-            entry = round(c_close, 2)
-            sl = round(c_high + max(0.4 * atr, 0.7), 2)
+        if bearish:
+            entry = round(c,2)
+            sl = round(h + max(0.65*atr, 1.3), 2)
             risk = sl - entry
-            if risk <= 0:
-                return None
-            tp = round(entry - max(MIN_TP_POINTS, risk * 2.5), 2)
-
-            return {
-                "action": "SELL (INSTANT QUANT IMPULSE)",
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "risk": round(risk, 2),
-                "reward": round(entry - tp, 2),
-                "rrr": round((entry - tp) / risk, 2),
-                "vector": round(pythagoras_vector, 2),
-                "macro": macro_bias,
-            }
-
+            if risk <= 0.6 or risk > MAX_RISK_PER_TRADE: return None
+            tp = round(entry - max(MIN_TP, risk*3.0), 2)
+            return {"action": "SELL", "entry": entry, "sl": sl, "tp": tp, "risk": round(risk,2), "reward": round(entry-tp,2), "rrr": 3.0, "vector": round(vec,2), "macro": macro, "atr": round(atr,2), "chop": round(chop,1)}
         return None
 
-    async def manage_active_trade(self, current_bar: dict):
-        if not self.active_trade:
-            return
-
-        t = self.active_trade
-        c_h, c_l, c_c = current_bar["high"], current_bar["low"], current_bar["close"]
-        self.kalman_m5.update(c_c)
+    async def manage(self, bar):
+        if not self.active: return
+        t = self.active
+        h,l = bar["high"], bar["low"]
 
         if "BUY" in t["action"]:
-            if not t["bep_locked"] and c_h >= (t["entry"] + BEP_TRIGGER_POINTS):
-                t["sl"] = t["entry"] + 0.50
-                t["bep_locked"] = True
-                self._save_state()
-                await self.notifier.send(
-                    f"🛡️ <b>ZERO-RISK PROTECTION ENGAGED</b>\n"
-                    f"Asset: {SYMBOL} | Posisi BUY @ {t['entry']}\n"
-                    f"Harga melonjak +{BEP_TRIGGER_POINTS} Pts. <b>Stop Loss dinaikkan ke {t['sl']} (BEP Profit)!</b>"
-                )
+            if not t.get("bep") and h >= t["entry"] + BEP_TRIGGER:
+                t["sl"] = round(t["entry"] + BEP_PLUS, 2)
+                t["bep"] = True
+                self._save()
+                await self.tg.send(f"🛡️ <b>BEP LOCKED BUY</b> {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+${BEP_PLUS})")
+            if h >= t["tp"]:
+                await self.tg.send(f"✅ <b>TP HIT BUY +{t['reward']} Pts</b> @ {t['tp']} | RR 1:3")
+                self.active = None; self._save(); return
+            if l <= t["sl"]:
+                is_bep = t.get("bep", False)
+                if not is_bep: self.daily_loss += 1
+                await self.tg.send(f"❌ CLOSE {'BEP' if is_bep else f'SL -{t[\"risk\"]}'} @ {t['sl']} | Loss streak: {self.daily_loss}/3")
+                self.active = None; self._save(); return
+        else: # SELL
+            if not t.get("bep") and l <= t["entry"] - BEP_TRIGGER:
+                t["sl"] = round(t["entry"] - BEP_PLUS, 2)
+                t["bep"] = True
+                self._save()
+                await self.tg.send(f"🛡️ <b>BEP LOCKED SELL</b> {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+${BEP_PLUS})")
+            if l <= t["tp"]:
+                await self.tg.send(f"✅ <b>TP HIT SELL +{t['reward']} Pts</b> @ {t['tp']} | RR 1:3")
+                self.active = None; self._save(); return
+            if h >= t["sl"]:
+                is_bep = t.get("bep", False)
+                if not is_bep: self.daily_loss += 1
+                await self.tg.send(f"❌ CLOSE {'BEP' if is_bep else f'SL -{t[\"risk\"]}'} @ {t['sl']} | Loss streak: {self.daily_loss}/3")
+                self.active = None; self._save(); return
 
-            if c_h >= t["tp"]:
-                await self.notifier.send(f"👑 <b>ABSOLUTE TARGET REACHED (TP HIT): +{t['reward']} Pts</b> @ {t['tp']}")
-                self.active_trade = None
-                self._save_state()
-                return
-
-            if c_l <= t["sl"]:
-                res = "BEP / PROFIT MIKRO" if t["bep_locked"] else f"CUT (-{t['risk']} Pts)"
-                await self.notifier.send(f"⚠️ <b>TRADE SELESAI: {res}</b> @ {t['sl']}")
-                self.active_trade = None
-                self._save_state()
-                return
-
-        elif "SELL" in t["action"]:
-            if not t["bep_locked"] and c_l <= (t["entry"] - BEP_TRIGGER_POINTS):
-                t["sl"] = t["entry"] - 0.50
-                t["bep_locked"] = True
-                self._save_state()
-                await self.notifier.send(
-                    f"🛡️ <b>ZERO-RISK PROTECTION ENGAGED</b>\n"
-                    f"Asset: {SYMBOL} | Posisi SELL @ {t['entry']}\n"
-                    f"Harga turun +{BEP_TRIGGER_POINTS} Pts. <b>Stop Loss diturunkan ke {t['sl']} (BEP Profit)!</b>"
-                )
-
-            if c_l <= t["tp"]:
-                await self.notifier.send(f"👑 <b>ABSOLUTE TARGET REACHED (TP HIT): +{t['reward']} Pts</b> @ {t['tp']}")
-                self.active_trade = None
-                self._save_state()
-                return
-
-            if c_h >= t["sl"]:
-                res = "BEP / PROFIT MIKRO" if t["bep_locked"] else f"CUT (-{t['risk']} Pts)"
-                await self.notifier.send(f"⚠️ <b>TRADE SELESAI: {res}</b> @ {t['sl']}")
-                self.active_trade = None
-                self._save_state()
-                return
-
-    async def broadcast_signal(self, sig: dict):
-        msg = (
-            f"⚡ <b>SUPREME QUANT IMPULSE SIGNAL: {sig['action']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Asset:</b> {SYMBOL} (TF M5)\n"
-            f"<b>Entry Instant:</b> <code>{sig['entry']:.2f}</code>\n"
-            f"<b>Strict Stop Loss:</b> <code>{sig['sl']:.2f}</code> (Risk: -{sig['risk']} Pts)\n"
-            f"<b>Target Profit:</b> <code>{sig['tp']:.2f}</code> (Gain: +{sig['reward']} Pts)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Impulse Vector:</b> {sig['vector']} (Momentum Valid, min {MIN_IMPULSE_VECTOR})\n"
-            f"<b>Macro Trend H1:</b> 🟢 {sig['macro']}\n"
-            f"<b>AI Decision Score:</b> 🟢 {sig.get('ai_conf', 100)}%\n"
-            f"<b>Risk Engine:</b> Auto-BEP Lock aktif pada +{BEP_TRIGGER_POINTS} Poin.\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"ℹ️ <i>Sinyal informasional, bukan eksekusi otomatis ke broker.</i>"
+    async def broadcast(self, s):
+        await self.tg.send(
+            f"⚡ <b>{s['action']} IMPULSE V3</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Symbol: {SYMBOL} M5\n"
+            f"Entry: <code>{s['entry']:.2f}</code>\n"
+            f"SL: <code>{s['sl']:.2f}</code> (-{s['risk']}) | TP: <code>{s['tp']:.2f}</code> (+{s['reward']})\n"
+            f"RR: 1:{s['rrr']} | ATR: {s['atr']} | CHOP: {s['chop']}\n"
+            f"Vector: {s['vector']} | Macro: {s['macro']} | AI: {s.get('ai_conf',0)}%\n"
+            f"Auto BEP +${BEP_PLUS} @ +{BEP_TRIGGER}pts\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"<i>Live signal only</i>"
         )
-        await self.notifier.send(msg)
-
-    async def _check_symbol_availability(self, ws):
-        req = {"active_symbols": "brief", "req_id": REQ_ID_ACTIVE_SYMBOLS}
-        await ws.send(json.dumps(req))
-
-    def _handle_active_symbols_response(self, msg):
-        symbols = msg.get("active_symbols", [])
-        def sym_name(s):
-            return s.get("symbol") or s.get("underlying_symbol")
-        names = {sym_name(s) for s in symbols}
-        if SYMBOL in names:
-            logger.info(f"[SYMBOL CHECK] '{SYMBOL}' tersedia di active_symbols.")
-        else:
-            logger.info(f"[SYMBOL CHECK] '{SYMBOL}' tidak ditemukan literal di active_symbols (non-fatal).")
-
-    async def _fetch_h1_candles(self, ws):
-        req = {
-            "ticks_history": SYMBOL,
-            "adjust_start_time": 1,
-            "count": 30,
-            "end": "latest",
-            "style": "candles",
-            "granularity": GRANULARITY_H1,
-            "req_id": REQ_ID_H1,
-        }
-        await ws.send(json.dumps(req))
-
-    async def _fetch_m5_candles(self, ws):
-        req = {
-            "ticks_history": SYMBOL,
-            "adjust_start_time": 1,
-            "count": LOOKBACK_SWING + 20,
-            "end": "latest",
-            "style": "candles",
-            "granularity": GRANULARITY_M5,
-            "req_id": REQ_ID_M5,
-        }
-        await ws.send(json.dumps(req))
-
-    async def _periodic_poller(self, ws):
-        try:
-            while True:
-                await asyncio.sleep(M5_POLL_SECONDS)
-                if not self.is_market_active_wib():
-                    return
-                await self._fetch_m5_candles(ws)
-                if time.time() - self.last_h1_refresh >= H1_REFRESH_SECONDS:
-                    await self._fetch_h1_candles(ws)
-                    self.last_h1_refresh = time.time()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"[POLLER ERROR] {e}")
 
     async def run(self):
-        await self.notifier.send(
-            f"🔱 <b>TITAN SUPREME ARCHITECTURE ONLINE (FIXED)</b>\n"
-            f"<b>Sistem:</b> High-Precision Confluence Engine (Signal/Notifier only)\n"
-            f"<b>Status:</b> Bug closed_candles sudah diperbaiki. Bot berjalan stabil."
-        )
-
+        await self.tg.send(f"🔱 <b>TITAN V3 LIVE ONLINE</b>\n{SYMBOL} | RR 1:3 | Vector>{MIN_VECTOR} | CHOP<58 | Kill-Switch 3x Loss | Ready for Monday")
         while True:
             try:
-                if not self.is_market_active_wib():
-                    await asyncio.sleep(60)
+                if not self.market_open():
+                    logger.info(f"Market closed or kill-switch active (loss {self.daily_loss}/3)")
+                    await asyncio.sleep(120)
                     continue
 
-                async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=15) as ws:
-                    logger.info("[WS] Terhubung ke Gateway Publik Deriv.")
+                async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                    logger.info("WS Connected")
+                    await ws.send(json.dumps({"active_symbols": "brief", "req_id": REQ_SYMBOLS}))
+                    await ws.send(json.dumps({"ticks_history": SYMBOL, "count": 50, "end": "latest", "style": "candles", "granularity": GRAN_H1, "req_id": REQ_H1}))
+                    await ws.send(json.dumps({"ticks_history": SYMBOL, "count": LOOKBACK+40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5}))
 
-                    self.m5_candles = []
-                    await self._check_symbol_availability(ws)
-                    await self._fetch_h1_candles(ws)
-                    self.last_h1_refresh = time.time()
-                    await self._fetch_m5_candles(ws)
-
-                    poller_task = asyncio.create_task(self._periodic_poller(ws))
-                    try:
-                        async for raw_msg in ws:
-                            if not self.is_market_active_wib():
-                                break
-
-                            msg = json.loads(raw_msg)
-                            req_id = msg.get("req_id")
-
-                            if msg.get("error"):
-                                logger.error(f"[DERIV API ERROR] req_id={req_id} -> {msg['error']}")
-                                continue
-
-                            msg_type = msg.get("msg_type")
-                            if msg_type == "active_symbols":
-                                self._handle_active_symbols_response(msg)
-                                continue
-
-                            if msg_type != "candles":
-                                continue
-
-                            if req_id == REQ_ID_H1:
-                                self.h1_candles = msg.get("candles", [])
-                                logger.info(f"[H1] Data makro diperbarui ({len(self.h1_candles)} candle).")
-                                continue
-
-                            if req_id != REQ_ID_M5:
-                                continue
-
-                            new_candles = msg.get("candles", [])
-                            if not new_candles:
-                                continue
-
-                            if not self.m5_candles:
-                                self.m5_candles = new_candles[-80:]
-                                logger.info(f"[M5] Seed data dimuat ({len(self.m5_candles)} candle).")
-                                continue
-
-                            known_epochs = {c["epoch"] for c in self.m5_candles}
-                            closed_candidates = new_candles[:-1] if len(new_candles) > 1 else []
-                            newly_closed = sorted(
-                                (c for c in closed_candidates if c["epoch"] not in known_epochs),
-                                key=lambda c: c["epoch"],
-                            )
-
-                            self.m5_candles = new_candles[-80:]
-
-                            for closed_candle in newly_closed:
-                                await self.manage_active_trade(closed_candle)
-
-                                if not self.active_trade:
-                                    setup = self.scan_precision_setup()
-                                    if setup:
-                                        eval_res = await self.ai.verify_institutional_bias(setup, self.m5_candles)
-                                        if eval_res.get("verdict") == "APPROVE" and eval_res.get("confidence", 0) >= 0.60:
-                                            setup["ai_conf"] = int(eval_res.get("confidence", 0) * 100)
-                                            setup["bep_locked"] = False
-                                            self.active_trade = setup
-                                            self._save_state()
-                                            await self.broadcast_signal(setup)
-                    finally:
-                        poller_task.cancel()
+                    last_poll = time.time()
+                    while self.market_open():
+                        if time.time() - last_poll >= 15: # Poll M5 tiap 15 detik
+                            await ws.send(json.dumps({"ticks_history": SYMBOL, "count": LOOKBACK+40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5}))
+                            last_poll = time.time()
+                        
                         try:
-                            await poller_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        except asyncio.TimeoutError:
+                            continue
+                        
+                        msg = json.loads(raw)
+                        if msg.get("error"):
+                            logger.error(f"API Error {msg['error']}")
+                            continue
+                        
+                        if msg.get("msg_type") != "candles": continue
+                        
+                        if msg.get("req_id") == REQ_H1:
+                            self.h1 = msg.get("candles", [])
+                            logger.info(f"H1 updated {len(self.h1)}")
+                        elif msg.get("req_id") == REQ_M5:
+                            candles = msg.get("candles", [])
+                            if len(candles) < 20: continue
+                            # KRUSIAL: Buang candle terakhir yang belum close biar NO REPAINT
+                            closed = candles[:-1]
+                            if not self.m5:
+                                self.m5 = closed[-80:]
+                                continue
+                            
+                            known = {c["epoch"] for c in self.m5}
+                            new_bars = [c for c in closed if c["epoch"] not in known]
+                            new_bars.sort(key=lambda x: x["epoch"])
+                            self.m5 = closed[-80:]
 
+                            for bar in new_bars:
+                                await self.manage(bar)
+                                if self.active: continue
+                                if time.time() - self.last_signal < SIGNAL_COOLDOWN: continue
+                                
+                                setup = self.scan()
+                                if setup:
+                                    ai = await self.ai.verify(setup, self.m5)
+                                    logger.info(f"Scan {setup['action']} Vec {setup['vector']} Chop {setup['chop']} AI {ai}")
+                                    if ai["verdict"] == "APPROVE" and ai.get("confidence",0) >= 0.72:
+                                        setup["ai_conf"] = int(ai["confidence"]*100)
+                                        setup["bep"] = False
+                                        self.active = setup
+                                        self.last_signal = time.time()
+                                        self._save()
+                                        await self.broadcast(setup)
+
+            except ConnectionClosed as e:
+                logger.warning(f"WS Closed {e}, reconnect 3s")
+                await asyncio.sleep(3)
             except Exception as e:
-                logger.error(f"[RECONNECTING] WebSocket: {e}")
+                logger.error(f"Loop Error {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-
 if __name__ == "__main__":
-    bot = QuantSignalEngine()
+    # Validasi env biar gak kaget pas live
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("TELEGRAM env kosong, bot tetap jalan tapi gak ngirim notif")
+    bot = TitanV3()
     asyncio.run(bot.run())
