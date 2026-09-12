@@ -6,46 +6,37 @@ import os
 import sys
 import time
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from collections import deque
 
 import aiohttp
 import numpy as np
-import pytz
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-# --- LOGGING PRO ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("TITAN_V3_LIVE")
 
-# --- CONFIG LIVE - JANGAN DIUBAH SEMBARANGAN ---
 DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 SYMBOL = os.getenv("TARGET_SYMBOL", "frxXAUUSD").strip()
 STATE_FILE = Path(os.getenv("STATE_FILE", "titan_v3_state.json"))
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# PARAMETER LIVE PRESET - UDAH DI-OPTIMIZE BUAT XAU SENIN
 GRAN_M5 = 300
 GRAN_H1 = 3600
 LOOKBACK = 28
 MIN_TP = 18.0
-BEP_TRIGGER = 5.0  # Lebih lega buat XAU, biar gak kesentuh spread
-BEP_PLUS = 1.0     # BEP + $1 profit
-MIN_VECTOR = 0.40  # 0.25 terlalu berisik, 0.40 itu sweet spot XAU
-MAX_SPREAD = 2.5   # Tolak sinyal kalau spread > $2.5
-MAX_RISK_PER_TRADE = 15.0 # Tolak setup kalau SL > $15
-SIGNAL_COOLDOWN = 1200 # 20 menit
+BEP_TRIGGER = 5.0
+BEP_PLUS = 1.0
+MIN_VECTOR = 0.40
+MAX_RISK_PER_TRADE = 15.0
+SIGNAL_COOLDOWN = 1200
 
 REQ_H1 = 101
 REQ_M5 = 102
 REQ_SYMBOLS = 100
-
-# === CORE QUANT ENGINE V3 ===
 
 class Kalman2D:
     def __init__(self, q=1e-5, r=0.8):
@@ -80,7 +71,6 @@ class MarketMath:
         for i in range(p, len(tr)):
             atr[i] = (atr[i-1]*(p-1) + tr[i]) / p
         return float(atr[-1])
-    
     @staticmethod
     def choppiness(h, l, c, p=14):
         if len(c) < p+2: return 50
@@ -88,7 +78,6 @@ class MarketMath:
         hl_range = np.max(h[-p:]) - np.min(l[-p:])
         if hl_range == 0: return 100
         return 100 * math.log10(tr_sum / hl_range) / math.log10(p)
-
     @staticmethod
     def impulse(candles, atr):
         if len(candles) < 3 or atr <= 0: return 0
@@ -106,15 +95,12 @@ class Telegram:
             self.session = aiohttp.ClientSession()
         return self.session
     async def send(self, txt):
-        if not self.url: 
-            logger.info(f"[TG-SKIP] {txt[:100]}")
-            return
+        if not self.url: return
         for i in range(3):
             try:
                 s = await self._sess()
                 async with s.post(self.url, json={"chat_id": self.chat_id, "text": txt, "parse_mode": "HTML"}, timeout=10) as r:
                     if r.status == 200: return
-                    if r.status == 429: await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"TG err {e}")
                 await asyncio.sleep(1)
@@ -127,7 +113,7 @@ class GeminiGate:
         if not self.key:
             return {"verdict": "APPROVE", "confidence": 0.80, "reason": "No Key Bypass"}
         ctx = [{"o": round(c["open"],2), "h": round(c["high"],2), "l": round(c["low"],2), "c": round(c["close"],2)} for c in candles[-8:]]
-        prompt = f"Act as strict XAUUSD institutional trader. Reject if: 1. No clear sweep 2. Chop 3. Weak close. Setup:{json.dumps(setup)} Context:{json.dumps(ctx)} Return ONLY JSON verdict APPROVE/REJECT confidence reason"
+        prompt = f"Act as strict XAUUSD trader. Reject traps. Setup:{json.dumps(setup)} Context:{json.dumps(ctx)} Return ONLY JSON verdict APPROVE/REJECT confidence reason"
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(self.url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.05, "response_mime_type": "application/json"}}, timeout=10) as r:
@@ -162,7 +148,6 @@ class TitanV3:
                 self.active = d.get("active_trade")
                 self.daily_loss = d.get("daily_loss", 0)
                 self.last_day = d.get("last_day", self.last_day)
-                logger.info(f"State loaded: {self.active}")
         except Exception as e:
             logger.error(f"Load err {e}")
 
@@ -178,18 +163,14 @@ class TitanV3:
 
     def market_open(self):
         now = datetime.now(timezone.utc)
-        # Reset daily loss
-        if now.day != self.last_day:
+        if now.day!= self.last_day:
             self.daily_loss = 0
             self.last_day = now.day
             self._save()
-        # XAU Deriv: Tutup Jumat 21:00 UTC, Buka Minggu 22:00 UTC
         if now.weekday() == 5 and now.hour >= 21: return False
         if now.weekday() == 6 and now.hour < 22: return False
         if now.weekday() == 6: return False
-        # Kill switch harian
-        if self.daily_loss >= 3: # Kalah 3x beruntun, stop hari itu
-            return False
+        if self.daily_loss >= 3: return False
         return True
 
     def macro(self):
@@ -211,9 +192,8 @@ class TitanV3:
 
         atr = MarketMath.wilder_atr(highs, lows, closes, 14)
         chop = MarketMath.choppiness(highs, lows, closes, 14)
-        
-        if atr < 0.9: return None # Market sepi
-        if chop > 58: return None # Market choppy / sideways, ini pembunuh akun live
+        if atr < 0.9: return None
+        if chop > 58: return None
 
         vec = MarketMath.impulse(self.m5, atr)
         if vec < MIN_VECTOR: return None
@@ -224,38 +204,23 @@ class TitanV3:
         o,h,l,c = opens[-1], highs[-1], lows[-1], closes[-1]
         rng = max(h-l, 0.1)
         body = abs(c-o)
-        if body/rng < 0.45: return None # Tolak doji
+        if body/rng < 0.45: return None
 
         lower_wick = min(o,c) - l
         upper_wick = h - max(o,c)
         macro = self.macro()
         _, vel = self.kalman_m5.update(c)
 
-        # === BUY LOGIC: SWEEP + REJECTION + MOMENTUM ===
-        bullish = (
-            l < swing_l and c > swing_l and 
-            lower_wick/rng >= 0.38 and 
-            body/rng >= 0.45 and
-            macro in ("BULLISH","NEUTRAL") and
-            vel > -0.15
-        )
-        # === SELL LOGIC ===
-        bearish = (
-            h > swing_h and c < swing_h and 
-            upper_wick/rng >= 0.38 and 
-            body/rng >= 0.45 and
-            macro in ("BEARISH","NEUTRAL") and
-            vel < 0.15
-        )
+        bullish = (l < swing_l and c > swing_l and lower_wick/rng >= 0.38 and body/rng >= 0.45 and macro in ("BULLISH","NEUTRAL") and vel > -0.15)
+        bearish = (h > swing_h and c < swing_h and upper_wick/rng >= 0.38 and body/rng >= 0.45 and macro in ("BEARISH","NEUTRAL") and vel < 0.15)
 
         if bullish:
             entry = round(c,2)
             sl = round(l - max(0.65*atr, 1.3), 2)
             risk = entry - sl
             if risk <= 0.6 or risk > MAX_RISK_PER_TRADE: return None
-            tp = round(entry + max(MIN_TP, risk*3.0), 2) # RR 1:3 FIX
+            tp = round(entry + max(MIN_TP, risk*3.0), 2)
             return {"action": "BUY", "entry": entry, "sl": sl, "tp": tp, "risk": round(risk,2), "reward": round(tp-entry,2), "rrr": 3.0, "vector": round(vec,2), "macro": macro, "atr": round(atr,2), "chop": round(chop,1)}
-
         if bearish:
             entry = round(c,2)
             sl = round(h + max(0.65*atr, 1.3), 2)
@@ -268,106 +233,135 @@ class TitanV3:
     async def manage(self, bar):
         if not self.active: return
         t = self.active
-        h,l = bar["high"], bar["low"]
+        h = bar["high"]
+        l = bar["low"]
 
         if "BUY" in t["action"]:
             if not t.get("bep") and h >= t["entry"] + BEP_TRIGGER:
                 t["sl"] = round(t["entry"] + BEP_PLUS, 2)
                 t["bep"] = True
                 self._save()
-                await self.tg.send(f"🛡️ <b>BEP LOCKED BUY</b> {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+${BEP_PLUS})")
+                msg_bep = f"🛡️ BEP LOCKED BUY {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+{BEP_PLUS})"
+                await self.tg.send(msg_bep)
             if h >= t["tp"]:
-                await self.tg.send(f"✅ <b>TP HIT BUY +{t['reward']} Pts</b> @ {t['tp']} | RR 1:3")
-                self.active = None; self._save(); return
+                reward = t.get("reward", 0)
+                tp_val = t.get("tp", 0)
+                await self.tg.send(f"✅ TP HIT BUY +{reward} Pts @ {tp_val} | RR 1:3")
+                self.active = None
+                self._save()
+                return
             if l <= t["sl"]:
                 is_bep = t.get("bep", False)
-                if not is_bep: self.daily_loss += 1
-                await self.tg.send(f"❌ CLOSE {'BEP' if is_bep else f'SL -{t[\"risk\"]}'} @ {t['sl']} | Loss streak: {self.daily_loss}/3")
-                self.active = None; self._save(); return
-        else: # SELL
+                if not is_bep:
+                    self.daily_loss += 1
+                risk_val = t.get("risk", 0)
+                sl_val = t.get("sl", 0)
+                if is_bep:
+                    close_msg = "BEP"
+                else:
+                    close_msg = f"SL -{risk_val}"
+                await self.tg.send(f"❌ CLOSE {close_msg} @ {sl_val} | Loss streak: {self.daily_loss}/3")
+                self.active = None
+                self._save()
+                return
+        else:
             if not t.get("bep") and l <= t["entry"] - BEP_TRIGGER:
                 t["sl"] = round(t["entry"] - BEP_PLUS, 2)
                 t["bep"] = True
                 self._save()
-                await self.tg.send(f"🛡️ <b>BEP LOCKED SELL</b> {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+${BEP_PLUS})")
+                msg_bep = f"🛡️ BEP LOCKED SELL {SYMBOL} Entry {t['entry']} SL -> {t['sl']} (+{BEP_PLUS})"
+                await self.tg.send(msg_bep)
             if l <= t["tp"]:
-                await self.tg.send(f"✅ <b>TP HIT SELL +{t['reward']} Pts</b> @ {t['tp']} | RR 1:3")
-                self.active = None; self._save(); return
+                reward = t.get("reward", 0)
+                tp_val = t.get("tp", 0)
+                await self.tg.send(f"✅ TP HIT SELL +{reward} Pts @ {tp_val} | RR 1:3")
+                self.active = None
+                self._save()
+                return
             if h >= t["sl"]:
                 is_bep = t.get("bep", False)
-                if not is_bep: self.daily_loss += 1
-                await self.tg.send(f"❌ CLOSE {'BEP' if is_bep else f'SL -{t[\"risk\"]}'} @ {t['sl']} | Loss streak: {self.daily_loss}/3")
-                self.active = None; self._save(); return
+                if not is_bep:
+                    self.daily_loss += 1
+                risk_val = t.get("risk", 0)
+                sl_val = t.get("sl", 0)
+                if is_bep:
+                    close_msg = "BEP"
+                else:
+                    close_msg = f"SL -{risk_val}"
+                await self.tg.send(f"❌ CLOSE {close_msg} @ {sl_val} | Loss streak: {self.daily_loss}/3")
+                self.active = None
+                self._save()
+                return
 
     async def broadcast(self, s):
-        await self.tg.send(
-            f"⚡ <b>{s['action']} IMPULSE V3</b>\n"
+        action = s.get("action", "")
+        entry = s.get("entry", 0)
+        sl = s.get("sl", 0)
+        tp = s.get("tp", 0)
+        risk = s.get("risk", 0)
+        reward = s.get("reward", 0)
+        rrr = s.get("rrr", 0)
+        atr = s.get("atr", 0)
+        chop = s.get("chop", 0)
+        vector = s.get("vector", 0)
+        macro = s.get("macro", "")
+        ai_conf = s.get("ai_conf", 0)
+
+        text = (
+            f"⚡ {action} IMPULSE V3\n"
             f"━━━━━━━━━━━━━━━\n"
             f"Symbol: {SYMBOL} M5\n"
-            f"Entry: <code>{s['entry']:.2f}</code>\n"
-            f"SL: <code>{s['sl']:.2f}</code> (-{s['risk']}) | TP: <code>{s['tp']:.2f}</code> (+{s['reward']})\n"
-            f"RR: 1:{s['rrr']} | ATR: {s['atr']} | CHOP: {s['chop']}\n"
-            f"Vector: {s['vector']} | Macro: {s['macro']} | AI: {s.get('ai_conf',0)}%\n"
-            f"Auto BEP +${BEP_PLUS} @ +{BEP_TRIGGER}pts\n"
+            f"Entry: {entry:.2f}\n"
+            f"SL: {sl:.2f} (-{risk}) | TP: {tp:.2f} (+{reward})\n"
+            f"RR: 1:{rrr} | ATR: {atr} | CHOP: {chop}\n"
+            f"Vector: {vector} | Macro: {macro} | AI: {ai_conf}%\n"
+            f"Auto BEP +{BEP_PLUS} @ +{BEP_TRIGGER}pts\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"<i>Live signal only</i>"
+            f"Live signal only"
         )
+        await self.tg.send(text)
 
     async def run(self):
-        await self.tg.send(f"🔱 <b>TITAN V3 LIVE ONLINE</b>\n{SYMBOL} | RR 1:3 | Vector>{MIN_VECTOR} | CHOP<58 | Kill-Switch 3x Loss | Ready for Monday")
+        await self.tg.send(f"🔱 TITAN V3.1 FIX ONLINE {SYMBOL} | RR 1:3 | Vector>{MIN_VECTOR} | Ready Senin")
         while True:
             try:
                 if not self.market_open():
-                    logger.info(f"Market closed or kill-switch active (loss {self.daily_loss}/3)")
                     await asyncio.sleep(120)
                     continue
-
                 async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=20) as ws:
                     logger.info("WS Connected")
                     await ws.send(json.dumps({"active_symbols": "brief", "req_id": REQ_SYMBOLS}))
                     await ws.send(json.dumps({"ticks_history": SYMBOL, "count": 50, "end": "latest", "style": "candles", "granularity": GRAN_H1, "req_id": REQ_H1}))
                     await ws.send(json.dumps({"ticks_history": SYMBOL, "count": LOOKBACK+40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5}))
-
                     last_poll = time.time()
                     while self.market_open():
-                        if time.time() - last_poll >= 15: # Poll M5 tiap 15 detik
+                        if time.time() - last_poll >= 15:
                             await ws.send(json.dumps({"ticks_history": SYMBOL, "count": LOOKBACK+40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5}))
                             last_poll = time.time()
-                        
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=10)
                         except asyncio.TimeoutError:
                             continue
-                        
                         msg = json.loads(raw)
-                        if msg.get("error"):
-                            logger.error(f"API Error {msg['error']}")
-                            continue
-                        
-                        if msg.get("msg_type") != "candles": continue
-                        
+                        if msg.get("error"): continue
+                        if msg.get("msg_type")!= "candles": continue
                         if msg.get("req_id") == REQ_H1:
                             self.h1 = msg.get("candles", [])
-                            logger.info(f"H1 updated {len(self.h1)}")
                         elif msg.get("req_id") == REQ_M5:
                             candles = msg.get("candles", [])
                             if len(candles) < 20: continue
-                            # KRUSIAL: Buang candle terakhir yang belum close biar NO REPAINT
                             closed = candles[:-1]
                             if not self.m5:
                                 self.m5 = closed[-80:]
                                 continue
-                            
                             known = {c["epoch"] for c in self.m5}
                             new_bars = [c for c in closed if c["epoch"] not in known]
                             new_bars.sort(key=lambda x: x["epoch"])
                             self.m5 = closed[-80:]
-
                             for bar in new_bars:
                                 await self.manage(bar)
                                 if self.active: continue
                                 if time.time() - self.last_signal < SIGNAL_COOLDOWN: continue
-                                
                                 setup = self.scan()
                                 if setup:
                                     ai = await self.ai.verify(setup, self.m5)
@@ -379,17 +373,12 @@ class TitanV3:
                                         self.last_signal = time.time()
                                         self._save()
                                         await self.broadcast(setup)
-
-            except ConnectionClosed as e:
-                logger.warning(f"WS Closed {e}, reconnect 3s")
+            except ConnectionClosed:
                 await asyncio.sleep(3)
             except Exception as e:
                 logger.error(f"Loop Error {e}", exc_info=True)
                 await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    # Validasi env biar gak kaget pas live
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("TELEGRAM env kosong, bot tetap jalan tapi gak ngirim notif")
     bot = TitanV3()
     asyncio.run(bot.run())
