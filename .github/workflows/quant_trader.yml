@@ -2,7 +2,7 @@ name: TITAN V4 TANI HYBRID
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # Tiap 15 menit kayak #52 lu
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,10 +23,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install websockets aiohttp numpy requests pandas python-dateutil pytz websocket-client urllib3 certifi python-telegram-bot
-          # Buat folder state biar DNA gak reset (fix cache #48-#51 lu)
           mkdir -p .github/state
+          ls -lh
 
-      - name: Restore DNA & Memory (Cache FIX dari #51)
+      - name: Restore DNA & Memory (Cache FIX)
         uses: actions/cache@v4
         with:
           path: |
@@ -34,7 +34,7 @@ jobs:
             .memory_tani_v4.json
             titan_v4_state.json
             .last_tani_v9.json
-          key: tani-dna-v4-${{ hashFiles('**/TITAN_V4_TANI_HYBRID_FINAL.py') }}
+          key: tani-dna-v4-${{ github.run_id }}
           restore-keys: |
             tani-dna-v4-
 
@@ -49,12 +49,24 @@ jobs:
           STATE_FILE: titan_v4_state.json
         run: |
           echo "=== TITAN V4 TANI HYBRID $(date) ==="
-          timeout 500 python TITAN_V4_TANI_HYBRID_FINAL.py || echo "Timeout 500s - normal for live bot"
+          ls -lh *.py
+          # FIX #98: auto-detect file mana yang ada
+          if [ -f "bot_core.py" ]; then
+            echo "Found bot_core.py - Running V4.1 Mode Panen"
+            timeout 500 python bot_core.py || echo "Timeout 500s - normal"
+          elif [ -f "TITAN_V4_1_MODE_PANEN_FIX_NO_SIGNAL.py" ]; then
+            timeout 500 python TITAN_V4_1_MODE_PANEN_FIX_NO_SIGNAL.py || echo "Timeout 500s"
+          elif [ -f "TITAN_V4_TANI_HYBRID_FINAL.py" ]; then
+            timeout 500 python TITAN_V4_TANI_HYBRID_FINAL.py || echo "Timeout 500s"
+          else
+            echo "ERROR: No bot file found!"
+            ls -lh
+            exit 1
+          fi
           
-      - name: Post Checkout Repository
+      - name: Post Check
         if: always()
         run: |
-          echo "Node 20 is being deprecated - workflow running with Node 24"
           ls -lh *.json || echo "No state yet"
           cat titan_v4_state.json || echo "No active trade"
 
