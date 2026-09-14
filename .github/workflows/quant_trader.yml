@@ -1,44 +1,62 @@
 name: TITAN V4 TANI HYBRID
+
 on:
   schedule:
-    - cron: '0 */5 * * *' # tiap 5 jam restart, biar 19200s muat
+    - cron: '0 */5 * * *'
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 330 # 5.5 jam, biar 19200s = 5h20m muat
+    timeout-minutes: 330
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install websockets aiohttp numpy requests
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install websockets aiohttp numpy requests
 
       - name: Restore State
         uses: actions/cache@v4
         with:
           path: |
             titan_v4_state.json
-           .dna_tani_v4.json
-           .memory_tani_v4.json
+            .dna_tani_v4.json
+            .memory_tani_v4.json
+            .last_tani_v9.json
           key: titan-v4-live-${{ github.run_number }}
-          restore-keys: titan-v4-live-
+          restore-keys: |
+            titan-v4-live-
 
       - name: Run TITAN V4.1 PANEN 5 JAM
         env:
           TARGET_SYMBOL: frxXAUUSD
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           STATE_FILE: titan_v4_state.json
         run: |
           echo "=== TITAN V4.1 PANEN $(date) 19200s ==="
-          timeout --preserve-status 19200 python bot_core.py || echo "Live 5h20m selesai - normal"
+          ls -lh *.py
+          if [ -f "bot_core.py" ]; then
+            echo "Found bot_core.py - Running 5h20m"
+            timeout --preserve-status 19200 python bot_core.py || echo "Live 5h20m selesai - normal"
+          else
+            echo "No bot file found"
+            ls -lh
+            exit 1
+          fi
 
-      - name: Save State
+      - name: Save State Info
         if: always()
         run: |
-          ls -lh *.json
-          echo '{"active_trade": null, "daily_loss": 0}' > titan_v4_state.json
-          cat titan_v4_state.json
+          ls -lh *.json || echo "No state yet"
+          cat titan_v4_state.json 2>/dev/null || echo "No active trade"
