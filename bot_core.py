@@ -1,12 +1,10 @@
 """
-🔱🌾 TITAN V4.1 MODE PANEN - FIX NO SIGNAL DARI KEMARIN
-Perubahan: Vector 0.22, Quorum 24%, Chop 62, ATR 0.6, OFI +-0.5, Cooldown 3 menit
-+ Debug log biar tau kenapa ke-block
+🔱🌾 TITAN V4.1 MODE PANEN - FIX SYNTAX ERROR #99
+Fix: f-string nested quote
 """
 import asyncio, json, logging, math, os, sys, time, tempfile, requests
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import deque
 import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -23,23 +21,22 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or os.getenv("T
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# === FIX MODE PANEN (LONGGARIN) ===
 GRAN_M5 = 300
 GRAN_H1 = 3600
 LOOKBACK = 24
-MIN_TP = 12.0  # dari 18 -> 12 biar gampang TP
-BEP_TRIGGER = 4.0 # dari 5 -> 4 biar cepet BEP
+MIN_TP = 12.0
+BEP_TRIGGER = 4.0
 BEP_PLUS = 0.8
-MIN_VECTOR = 0.22  # FIX UTAMA: dari 0.40 -> 0.22
-MAX_RISK_PER_TRADE = 18.0 # dari 15 -> 18
-SIGNAL_COOLDOWN = 180 # dari 900 -> 180 = 3 menit
-QUORUM_KECIL = 24 # dari 32 -> 24 = 6 petani cukup
+MIN_VECTOR = 0.22
+MAX_RISK_PER_TRADE = 18.0
+SIGNAL_COOLDOWN = 180
+QUORUM_KECIL = 24
 QUORUM_RAYA = 48
-MAX_SPREAD = 12.0 # dari 9 -> 12
-MAX_CHOP = 62 # dari 58 -> 62
-MIN_ATR = 0.6 # dari 0.9 -> 0.6
-MIN_BODY_RATIO = 0.35 # dari 0.45 -> 0.35
-MIN_WICK_RATIO = 0.28 # dari 0.38 -> 0.28
+MAX_SPREAD = 12.0
+MAX_CHOP = 62
+MIN_ATR = 0.6
+MIN_BODY_RATIO = 0.35
+MIN_WICK_RATIO = 0.28
 
 REQ_H1, REQ_M5 = 101, 102
 
@@ -221,7 +218,6 @@ class TitanV41:
         buy_pct, sell_pct, colony = run_colony(closes.tolist(), highs.tolist(), lows.tolist())
         macro=self.macro_kalman(); _, vel=self.kalman_m5.update(c)
 
-        # DEBUG kenapa ke-block (ini yang bikin lu gak ada sinyal dari kemarin)
         if atr < MIN_ATR:
             if self.no_signal_count%20==0: logger.info(f"BLOCK ATR {atr:.2f} < {MIN_ATR}")
             return None
@@ -241,11 +237,10 @@ class TitanV41:
         super_buy = buy_pct>=90 and vec>=0.7
         super_sell = sell_pct>=90 and vec>=0.7
 
-        # MODE PANEN: OFI lebih longgar +-0.5
         if bullish and (buy_pct>=QUORUM_KECIL or super_buy) and ofi>-0.50:
             entry=round(c,2); sl=round(l - max(0.60*atr,1.0),2); risk=entry-sl
             if risk<=0.5 or risk>MAX_RISK_PER_TRADE: return None
-            tp=round(entry+max(MIN_TP, risk*2.5),2) # RR 1:2.5 biar gampang TP
+            tp=round(entry+max(MIN_TP, risk*2.5),2)
             return {"action":"BUY","entry":entry,"sl":sl,"tp":tp,"risk":round(risk,2),"reward":round(tp-entry,2),"rrr":2.5,"vector":round(vec,2),"macro":macro,"atr":round(atr,2),"chop":round(chop,1),"colony_buy":buy_pct,"colony_sell":sell_pct,"ofi":ofi,"super":super_buy}
         if bearish and (sell_pct>=QUORUM_KECIL or super_sell) and ofi<0.50:
             entry=round(c,2); sl=round(h + max(0.60*atr,1.0),2); risk=sl-entry
@@ -253,13 +248,14 @@ class TitanV41:
             tp=round(entry-max(MIN_TP, risk*2.5),2)
             return {"action":"SELL","entry":entry,"sl":sl,"tp":tp,"risk":round(risk,2),"reward":round(entry-tp,2),"rrr":2.5,"vector":round(vec,2),"macro":macro,"atr":round(atr,2),"chop":round(chop,1),"colony_buy":buy_pct,"colony_sell":sell_pct,"ofi":ofi,"super":super_sell}
         if self.no_signal_count%30==0:
-            logger.info(f"NO SETUP c={c:.2f} vec={vec:.2f} chop={chop:.1f} atr={atr:.2f} colony B{buy_pct:.0f}/S{sell_pct:.0f} ofi={ofi:+.2f} swingH={swing_h:.2f} swingL={swing_l:.2f}")
+            logger.info(f"NO SETUP c={c:.2f} vec={vec:.2f} chop={chop:.1f} atr={atr:.2f} colony B{buy_pct:.0f}/S{sell_pct:.0f} ofi={ofi:+.2f}")
         self.no_signal_count+=1
         return None
 
     async def manage(self, bar):
         if not self.active: return
         t=self.active; h=bar["high"]; l=bar["low"]
+        # FIX SYNTAX ERROR #99 - pakai double quote di dalam f-string
         if "BUY" in t["action"]:
             if not t.get("bep") and h >= t["entry"] + BEP_TRIGGER:
                 t["sl"]=round(t["entry"]+BEP_PLUS,2); t["bep"]=True; self._save_state()
@@ -269,7 +265,9 @@ class TitanV41:
                 self.memory["gudang"]+=32 if t.get("super") else 15; self.active=None; self._save_state(); return
             if l<=t["sl"]:
                 if not t.get("bep"): self.daily_loss+=1
-                await self.tg.send(f"❌ CLOSE {'BEP' if t.get('bep') else f'SL -{t['risk']}'} Loss {self.daily_loss}/3")
+                risk_val = t["risk"]
+                status = "BEP" if t.get("bep") else f"SL -{risk_val}"
+                await self.tg.send(f"❌ CLOSE {status} Loss {self.daily_loss}/3")
                 self.active=None; self._save_state(); return
         else:
             if not t.get("bep") and l <= t["entry"] - BEP_TRIGGER:
@@ -280,7 +278,9 @@ class TitanV41:
                 self.memory["gudang"]+=32 if t.get("super") else 15; self.active=None; self._save_state(); return
             if h>=t["sl"]:
                 if not t.get("bep"): self.daily_loss+=1
-                await self.tg.send(f"❌ CLOSE {'BEP' if t.get('bep') else f'SL -{t['risk']}'} Loss {self.daily_loss}/3")
+                risk_val = t["risk"]
+                status = "BEP" if t.get("bep") else f"SL -{risk_val}"
+                await self.tg.send(f"❌ CLOSE {status} Loss {self.daily_loss}/3")
                 self.active=None; self._save_state(); return
 
     async def broadcast(self, s):
@@ -295,13 +295,13 @@ class TitanV41:
         await self.tg.send_photo(caption)
 
     async def run(self):
-        await self.tg.send(f"🔱 TITAN V4.1 MODE PANEN ONLINE {SYMBOL} | Vec>{MIN_VECTOR} Quorum>{QUORUM_KECIL}% Chop<{MAX_CHOP} RR 1:2.5 | Fix No Signal")
+        await self.tg.send(f"🔱 TITAN V4.1 MODE PANEN ONLINE {SYMBOL} | Vec>{MIN_VECTOR} Quorum>{QUORUM_KECIL}% Chop<{MAX_CHOP} RR 1:2.5 | Fix #99 Syntax")
         while True:
             try:
                 if not self.market_open():
                     await asyncio.sleep(60*30); continue
                 async with websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                    logger.info("WS Connected V4.1 PANEN")
+                    logger.info("WS Connected V4.1 PANEN FIXED")
                     await ws.send(json.dumps({"ticks_history": SYMBOL, "count": 50, "end": "latest", "style": "candles", "granularity": GRAN_H1, "req_id": REQ_H1}))
                     await ws.send(json.dumps({"ticks_history": SYMBOL, "count": 40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5}))
                     last_poll=time.time(); last_ofi=time.time(); _, ofi = self.fetcher.get_ofi_sync(); ofi=ofi or 0.0
@@ -313,9 +313,9 @@ class TitanV41:
                             await ws.send(json.dumps({"ticks_history": SYMBOL, "count": 40, "end": "latest", "style": "candles", "granularity": GRAN_M5, "req_id": REQ_M5})); last_poll=time.time()
                         try: raw=await asyncio.wait_for(ws.recv(), timeout=10)
                         except asyncio.TimeoutError:
-                            if time.time()-self.last_debug>1800: # tiap 30 menit debug kalau gak ada sinyal
+                            if time.time()-self.last_debug>1800:
                                 self.last_debug=time.time()
-                                await self.tg.send(f"⏳ STANDBY {SYMBOL} No Signal {self.no_signal_count}x | OFI {ofi:+.2f} | Loss {self.daily_loss}/3 | Mode Panen V4.1")
+                                await self.tg.send(f"⏳ STANDBY {SYMBOL} No Signal {self.no_signal_count}x | OFI {ofi:+.2f} | Loss {self.daily_loss}/3 | V4.1 FIXED")
                             continue
                         msg=json.loads(raw)
                         if msg.get("error"): continue
@@ -336,7 +336,7 @@ class TitanV41:
                                 if setup:
                                     ai=await self.ai.verify(setup, self.m5)
                                     logger.info(f"SETUP {setup['action']} V{setup['vector']} COL B{setup['colony_buy']:.0f} S{setup['colony_sell']:.0f} OFI {ofi:+.2f} AI {ai}")
-                                    if ai["verdict"]=="APPROVE" and ai.get("confidence",0)>=0.65: # dari 0.72 -> 0.65
+                                    if ai["verdict"]=="APPROVE" and ai.get("confidence",0)>=0.65:
                                         setup["ai_conf"]=int(ai["confidence"]*100); setup["bep"]=False
                                         self.active=setup; self.last_signal=time.time(); self.no_signal_count=0; self._save_state()
                                         await self.broadcast(setup)
